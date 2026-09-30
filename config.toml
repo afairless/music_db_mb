@@ -1,0 +1,23 @@
+# =============================================================================
+# mbdb — configuration
+# =============================================================================
+#
+# This file provides defaults for all mbdb commands. CLI flags always take
+# precedence over values in this file.
+#
+# Run `cargo run -- --help` for the full CLI reference.
+# =============================================================================
+
+# ---------- Defaults ---------------------------------------------------------
+
+## Directory where MusicBrainz dump tarballs are downloaded and kept.
+## Override with: import --dump-dir <PATH>
+dump_dir = "~/musicbrainz_db/dumps"
+
+## Path to the output DuckDB database file.
+## Override with: import --db <PATH>
+db = "~/musicbrainz_db/musicbrainz.duckdb"
+
+## Import scope: which table groups to load ("core" | "derived" | "core+derived").
+## Overridable subset for tests.
+tables = "core+derived"

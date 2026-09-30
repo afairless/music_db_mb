@@ -1,0 +1,4 @@
+target/
+*.duckdb
+.env
+.pi
