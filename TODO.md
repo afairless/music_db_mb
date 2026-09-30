@@ -23,6 +23,8 @@ Pre-work checks (done 2026-09-30): `cargo/rustc` 1.91.1 present; `df -h /home/tr
 plan") with README + plan doc committed and a clean tree; data root `~/musicbrainz_db/` to be
 created by the download script (step 6).
 
+## Steps
+
 | # | Commit message | Logical unit | Key deliverables | Tests |
 | --- | --- | --- | --- | --- |
 | 1 | `chore: scaffold cargo project skeleton` | Project skeleton | `Cargo.toml` (duckdb, clap, toml deps), `config.toml` (`dump_dir`/`db`/`tables` defaults), `.gitignore`, `tests/` dir | — (smoke: `cargo build`) |
