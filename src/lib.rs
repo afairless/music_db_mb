@@ -2,4 +2,4 @@
 
 pub mod mbdb;
 
-pub use mbdb::{config, manifest, schema};
+pub use mbdb::{config, manifest, schema, tsv};
