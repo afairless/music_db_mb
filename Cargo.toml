@@ -10,6 +10,11 @@ clap = { version = "4", features = ["derive"] }
 # Database
 duckdb = { version = "1", features = ["bundled"] }
 
+# Dump archives (streaming decompression + tar)
+bzip2 = "0.4"
+xz2 = "0.1"
+tar = "0.4"
+
 # Config
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }

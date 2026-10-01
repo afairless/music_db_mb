@@ -175,6 +175,47 @@ impl Row {
     pub fn is_empty(&self) -> bool {
         self.fields.is_empty()
     }
+
+    /// Re-render the row as COPY text, exactly as a dump member would ship
+    /// it (tabs between fields, escapes re-applied, `\N` for NULL).
+    ///
+    /// Used by the loader to log rejected rows: the bytes are byte-identical
+    /// to what the source TSV contained.
+    pub fn to_copy_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (i, field) in self.fields.iter().enumerate() {
+            if i > 0 {
+                out.push(b'\t');
+            }
+            match field {
+                Field::Null => out.extend_from_slice(b"\\N"),
+                Field::Value(bytes) => out.extend_from_slice(&escape_copy(bytes)),
+            }
+        }
+        out.push(b'\n');
+        out
+    }
+}
+
+/// Escape a value the way COPY *output* does — the inverse of `unescape`
+/// for every byte COPY escapes: backslash, tab, and the control characters.
+///
+/// Any other byte passes through unchanged.
+pub fn escape_copy(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for &byte in bytes {
+        match byte {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            0x0b => out.extend_from_slice(b"\\v"),
+            _ => out.push(byte),
+        }
+    }
+    out
 }
 
 /// Interpret a COPY-text boolean: `t` → `Some(true)`, `f` → `Some(false)`.
@@ -381,23 +422,6 @@ mod tests {
     /// COPY *output* escapement — the inverse of `unescape` for the bytes
     /// COPY actually escapes. Round-tripping through it reproduces the dump
     /// bytes for the original value.
-    fn copy_escape(bytes: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(bytes.len());
-        for &byte in bytes {
-            match byte {
-                b'\\' => out.extend_from_slice(b"\\\\"),
-                b'\t' => out.extend_from_slice(b"\\t"),
-                b'\n' => out.extend_from_slice(b"\\n"),
-                b'\r' => out.extend_from_slice(b"\\r"),
-                0x08 => out.extend_from_slice(b"\\b"),
-                0x0c => out.extend_from_slice(b"\\f"),
-                0x0b => out.extend_from_slice(b"\\v"),
-                _ => out.push(byte),
-            }
-        }
-        out
-    }
-
     #[test]
     fn escape_then_parse_round_trips() {
         // The values that COPY output escapes must survive a full
@@ -418,9 +442,18 @@ mod tests {
             b"",
         ];
         for original in originals {
-            let escaped = copy_escape(original);
+            let escaped = escape_copy(original);
             assert_eq!(parse_field(&escaped), v(original));
         }
+    }
+
+    #[test]
+    fn to_copy_bytes_reconstructs_the_shipped_row() {
+        // Rendering a parsed row reproduces the source TSV line verbatim,
+        // so rejections logged by the loader show exactly what the dump
+        // contained.
+        let row = Row::parse(b"1\t\\N\ta\\\\b\t\\t");
+        assert_eq!(row.to_copy_bytes(), b"1\t\\N\ta\\\\b\t\\t\n");
     }
 
     #[test]

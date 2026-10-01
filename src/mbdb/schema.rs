@@ -87,10 +87,30 @@ fn sql_kind(kind: Kind) -> &'static str {
 
 /// Build the `CREATE TABLE IF NOT EXISTS` statement for one manifest table.
 ///
-/// Returns the complete standalone statement; the caller applies the
-/// statements in [`ALL`](crate::mbdb::manifest::ALL) order so every FK target
-/// exists when its referencing table is created.
+/// Returns the complete standalone statement with `FOREIGN KEY` clauses
+/// included; the caller applies the statements in
+/// [`ALL`](crate::mbdb::manifest::ALL) order so every FK target exists when
+/// its referencing table is created (DuckDB validates FK targets at DDL
+/// time). The streaming loader builds its load target with
+/// [`SchemaOptions`] `foreign_keys = false` instead — see [`ddl_with`].
 pub fn ddl(table: &TableManifest) -> String {
+    ddl_with(table, true)
+}
+
+/// Build the DDL for one manifest table, optionally omitting FK clauses.
+///
+/// `foreign_keys = false` drops every `FOREIGN KEY` line while keeping
+/// columns, defaults, primary keys, and CHECK constraints intact. The
+/// loader uses this for the import target: this DuckDB build enforces
+/// foreign keys on insert with no way to disable them, and the dump's
+/// alphabetical member order plus same-table parent/child hierarchies
+/// cannot guarantee FK targets are present when a row streams in (a
+/// single-pass loader cannot reorder members of a compressed tar).
+/// Referential integrity is preserved by construction instead — the
+/// corrected load order, per-row manifest validation, and the loader's
+/// post-import verification (orphan counts per FK edge) — and joins are
+/// by integer id at query time.
+pub fn ddl_with(table: &TableManifest, foreign_keys: bool) -> String {
     let mut lines =
         Vec::with_capacity(table.columns.len() + table.foreign_keys.len() + table.checks.len() + 2);
 
@@ -116,12 +136,14 @@ pub fn ddl(table: &TableManifest) -> String {
         lines.push(format!("    PRIMARY KEY ({cols})"));
     }
 
-    for fk in table.foreign_keys {
-        let column = fk.column;
-        let target = fk.target;
-        lines.push(format!(
-            "    FOREIGN KEY ({column}) REFERENCES {target}(id)"
-        ));
+    if foreign_keys {
+        for fk in table.foreign_keys {
+            let column = fk.column;
+            let target = fk.target;
+            lines.push(format!(
+                "    FOREIGN KEY ({column}) REFERENCES {target}(id)"
+            ));
+        }
     }
 
     for check in table.checks {
@@ -134,13 +156,36 @@ pub fn ddl(table: &TableManifest) -> String {
     format!("CREATE TABLE IF NOT EXISTS {name} (\n{body}\n);")
 }
 
+/// Options controlling the emitted schema DDL.
+#[derive(Debug, Clone, Copy)]
+pub struct SchemaOptions {
+    /// Emit `FOREIGN KEY` clauses (`true` by default).
+    pub foreign_keys: bool,
+}
+
+impl Default for SchemaOptions {
+    fn default() -> Self {
+        SchemaOptions { foreign_keys: true }
+    }
+}
+
 /// Execute the full schema DDL against a connection, in corrected load order.
 ///
 /// Idempotent — safe to call repeatedly (every statement is guarded with
-/// `IF NOT EXISTS`).
+/// `IF NOT EXISTS`). Emits FK clauses (the DDL-order contract verified by
+/// the smoke tests); the loader calls [`create_schema_with`] to build its
+/// FK-free load target.
 pub fn create_schema(conn: &mut Connection) -> Result<(), SchemaError> {
+    create_schema_with(conn, &SchemaOptions::default())
+}
+
+/// Execute the full schema DDL with explicit options (see [`SchemaOptions`]).
+pub fn create_schema_with(
+    conn: &mut Connection,
+    options: &SchemaOptions,
+) -> Result<(), SchemaError> {
     for table in ALL {
-        let statement = ddl(table);
+        let statement = ddl_with(table, options.foreign_keys);
         conn.execute_batch(&statement)
             .map_err(|e| SchemaError::Execute {
                 table: table.name.to_owned(),
@@ -197,5 +242,21 @@ mod tests {
         // gid-redirect provenance FK
         let statement = ddl(manifest::table("artist_gid_redirect").unwrap());
         assert!(statement.contains("FOREIGN KEY (new_id) REFERENCES artist(id)"));
+    }
+
+    #[test]
+    fn test_ddl_without_foreign_keys_keeps_rest() {
+        // The loader's load target omits FK clauses (this DuckDB build
+        // enforces FKs on insert with no disable knob, incompatible with
+        // single-pass streaming) but keeps everything else intact.
+        let with_fks = ddl(manifest::table("track").unwrap());
+        let without = ddl_with(manifest::table("track").unwrap(), false);
+        assert!(with_fks.contains("FOREIGN KEY"));
+        assert!(!without.contains("FOREIGN KEY"));
+        // Columns, PK, and CHECK constraints survive.
+        assert!(without.contains("id INTEGER NOT NULL"));
+        assert!(without.contains("PRIMARY KEY (id)"));
+        assert!(without.contains("CHECK (length IS NULL OR length > 0)"));
+        assert!(without.contains("CHECK (edits_pending >= 0)"));
     }
 }
