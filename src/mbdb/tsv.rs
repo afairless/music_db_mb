@@ -218,13 +218,18 @@ pub fn escape_copy(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Interpret a COPY-text boolean: `t` → `Some(true)`, `f` → `Some(false)`.
+/// Interpret a COPY-text boolean: `0`/`1` → `Some(false)`/`Some(true)`, with
+/// `t`/`f` accepted as the canonical PostgreSQL COPY output aliases.
 ///
 /// Anything else returns `None` so the loader can route the row to the
-/// rejections log. MusicBrainz dumps always use the canonical COPY output
-/// forms `t`/`f` (the plan pins this against the sample dump).
+/// rejections log. Schema-31 MusicBrainz dump exports render booleans as
+/// integers (`ended`, `video`, `is_data_track`, `primary_for_locale`, …)
+/// and no `t`/`f` value appears anywhere in the 2026-10-01 sample (verified
+/// empirically); the `t`/`f` legacy forms are kept for tolerance.
 pub fn parse_bool(bytes: &[u8]) -> Option<bool> {
     match bytes {
+        b"1" => Some(true),
+        b"0" => Some(false),
         b"t" => Some(true),
         b"f" => Some(false),
         _ => None,
@@ -368,10 +373,12 @@ mod tests {
 
     #[test]
     fn bool_values() {
+        assert_eq!(parse_bool(b"1"), Some(true));
+        assert_eq!(parse_bool(b"0"), Some(false));
         assert_eq!(parse_bool(b"t"), Some(true));
         assert_eq!(parse_bool(b"f"), Some(false));
         assert_eq!(parse_bool(b"true"), None);
-        assert_eq!(parse_bool(b"1"), None);
+        assert_eq!(parse_bool(b"yes"), None);
         assert_eq!(parse_bool(b""), None);
     }
 

@@ -1,1 +1,167 @@
-fn main() {}
+//! mbdb — MusicBrainz-derived DuckDB builder CLI (milestone-1 import).
+//!
+//! Downloads are handled by `scripts/download_dumps.sh` (checksum-gated);
+//! this binary turns the verified tarballs into the load-target DuckDB
+//! database. Query subcommands arrive in later steps.
+
+use clap::{Args, Parser, Subcommand};
+use duckdb::Connection;
+use std::path::PathBuf;
+
+use mbdb::config::{CliOverrides, Config, DEFAULT_CONFIG_PATH, Settings};
+use mbdb::import::{LoadReport, load, rejections_path, verify_integrity};
+
+/// The mbdb command-line interface.
+#[derive(Debug, Parser)]
+#[command(name = "mbdb")]
+#[command(about = "MusicBrainz-derived DuckDB builder (milestone-1 import)")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+/// Supported subcommands.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Import MusicBrainz dump tarballs into a DuckDB database.
+    Import(ImportArgs),
+}
+
+/// Arguments for `mbdb import`.
+#[derive(Debug, Args)]
+struct ImportArgs {
+    /// Override the config file path (default: ./config.toml).
+    #[arg(long, value_name = "PATH")]
+    config: Option<String>,
+
+    /// Override the dump directory (config: dump_dir).
+    #[arg(long, value_name = "DIR")]
+    dump_dir: Option<String>,
+
+    /// Override the output database path (config: db).
+    #[arg(long, value_name = "PATH")]
+    db: Option<String>,
+
+    /// Import scope: core | derived | core+derived (config: tables).
+    #[arg(long, value_name = "SCOPE")]
+    tables: Option<String>,
+
+    /// Resume an interrupted import from its checkpoint.
+    #[arg(long)]
+    resume: bool,
+}
+
+fn main() {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Import(args) => run_import(&args),
+    }
+}
+
+fn run_import(args: &ImportArgs) {
+    let config_path = match args.config.as_ref() {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(DEFAULT_CONFIG_PATH),
+    };
+    let config = match Config::load(&config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    };
+    let overrides = CliOverrides {
+        dump_dir: args.dump_dir.clone(),
+        db: args.db.clone(),
+        tables: args.tables.clone(),
+    };
+    let settings = match Settings::resolve(config.as_ref(), &overrides) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!(
+        "import: dump-dir {} · db {}",
+        settings.dump_dir, settings.db
+    );
+    let report = match load(&settings, args.resume) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    };
+    print_report(&settings, &report);
+}
+
+fn print_report(settings: &Settings, report: &LoadReport) {
+    if report.archives.is_empty() {
+        println!(
+            "no archives imported (check --dump-dir {})",
+            settings.dump_dir
+        );
+        return;
+    }
+
+    println!(
+        "imported {} archive(s): {}",
+        report.archives.len(),
+        report.archives.join(", ")
+    );
+
+    let db_path = PathBuf::from(&settings.db);
+    let mut orphan_total: u64 = 0;
+    // Referential-integrity pass on the finished load target. The run
+    // notes must show this clean (zero orphans per manifest FK edge).
+    let mut conn = match Connection::open(&db_path) {
+        Ok(conn) => conn,
+        Err(error) => {
+            eprintln!(
+                "warning: could not reopen {} for integrity check ({})",
+                settings.db, error
+            );
+            return;
+        }
+    };
+    match verify_integrity(&mut conn) {
+        Ok(edges) => {
+            for (_, count) in edges.iter() {
+                orphan_total += *count;
+            }
+        }
+        Err(error) => eprintln!("warning: integrity check failed: {error}"),
+    }
+
+    for (table, stats) in report.tables.iter() {
+        println!(
+            "  loaded {table}: {} rows ({} resumed, {} rejected)",
+            stats.rows, stats.resumed_rows, stats.rejected
+        );
+    }
+    if !report.skipped_members.is_empty() {
+        println!(
+            "  skipped (no pinned manifest): {}",
+            report.skipped_members.join(", ")
+        );
+    }
+    if report.rejections.is_empty() {
+        println!("rejections: none");
+    } else {
+        println!(
+            "rejections: {} table(s) — see {}",
+            report.rejections.len(),
+            rejections_path(&db_path).to_string_lossy()
+        );
+        for (table, summary) in report.rejections.iter() {
+            println!("  {table}: {} rejected row(s)", summary.count);
+        }
+    }
+    if orphan_total == 0 {
+        println!("referential integrity: CLEAN");
+    } else {
+        println!("referential integrity: {orphan_total} orphan(s) — inspect the run");
+    }
+}

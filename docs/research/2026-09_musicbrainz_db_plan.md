@@ -190,7 +190,7 @@ practicable, the house verify gate (test → clippy → fmt → release build) b
 | --- | --- | --- | --- | --- |
 | 0 | *(pre-work, no commit)* | Repo scaffold + plan doc commit | `git init`; README.md; AGENTS.md (house conventions: Rust/verify gate/error handling, per the wiki repo); config.toml; `docs/research/2026-09_musicbrainz_db_plan.md` (this doc); `df -h /home/tr` ≥ 40 GB free | — |
 | 1 | `feat(schema): define target tables, column manifests, and load order` | Schema as embedded SQL/migration | `src/mbdb/schema.rs` + `src/mbdb/manifest.rs` — full target-DDL for §3 tables with `gid` columns as shipped (schema 31, no `mbid` table); per-table column manifests (no TSV headers); load-order graph (artists → credits/aliases → RG → release → recording → medium → track → work → label/area → links → derived, so the `track.recording` FK resolves) | Schema DDL executed on a scratch duckdb; table list matches the §3 matrix; manifest column counts verified against the sample dump |
-| 2 | `feat(import): PG-COPY TSV streaming importer with resume` | Streaming parser + loader | `src/mbdb/tsv.rs` (backslash escapes, `t/f` booleans, `\N` = NULL), `src/mbdb/import.rs` (batch INSERTs via manifest, checkpoint/resume, per-table counters, rejections log) | Fixture TSV incl. tabs/newlines/backslashes/booleans/`\N`/empty-string; interrupted-run resume test; counts match fixture |
+| 2 | `feat(import): PG-COPY TSV streaming importer with resume` | Streaming parser + loader | `src/mbdb/tsv.rs` (backslash escapes, `0/1` booleans — see §R2 deviation, `\N` = NULL), `src/mbdb/import.rs` (batch INSERTs via manifest, checkpoint/resume, per-table counters, rejections log) | Fixture TSV incl. tabs/newlines/backslashes/booleans/`\N`/empty-string; interrupted-run resume test; counts match fixture |
 | 3 | `feat(import): download script + sample-dump smoke` | Download + P0 smoke import | `scripts/download_dumps.sh` (MD5SUMS verification) with bz2/xz detection; import the **sample** dump (`sample/` — note: `.tar.xz`) into a scratch DB | Sample import row-counts recorded (run notes §R2); zero unexpected rejections |
 | 4 | *(no commit)* | Full release import run | `scripts/download_dumps.sh` + `mbdb import` against `fullexport` LATEST (dump 7 GB, ~30-180 min) | Inventory vs loaded counts per table; column-manifest checks pass; run notes §R3 |
 | 5 | `feat(query): name-first query layer + JSON contract` | Query surface (M1) | `src/mbdb/query.rs` + CLI (`query artist/release-group/release/recording/work/wikidata`); exact-match-first ordering with stable id/gid tiebreakers; aliases; no silent filtering of status/duplicates | Unit tests: exact vs alias vs substring ordering; disambiguated duplicate surfacing; contract JSON snapshots (golden files) |
@@ -258,5 +258,70 @@ Status tags: **[verified]** = checked against the 2026-09-01 sample dump on 2026
 
 ## Run notes
 
-Reserved for execution-time measurements (inventory counts, sample-import counts, full-import counts,
-battery results, refresh-cycle record) per the house documentation conventions.
+Execution-time measurements (inventory counts, sample-import counts, full-import counts, battery
+results, refresh-cycle record) per the house documentation conventions.
+
+### §R1 — Sample-dump inventory (2026-10-01 dump, schema 31)
+
+- Archive: `sample/20261001-000001/mbdump-sample.tar.xz` (346 MB compressed, 1.7 GB decompressed,
+  239 members; confirms `mbdump-sample.tar.xz` — **xz, not bz2** — for the P0 smoke import).
+- Members: 5 metadata files at the tar root (`TIMESTAMP`, `COPYING`, `README`, `REPLICATION_SEQUENCE`,
+  `SCHEMA_SEQUENCE`) + `mbdump/…` tables. The sample ships **core members only**; no derived members
+  (`l_*_wikidata`, `recording_first_release_date`, …), so the derived path is first exercised at the
+  full import (milestone-4 TODO).
+- Member order in the tar is alphabetical by file stem, independent of load-order (_release_ before
+  _release_group_, _release_group_ before _release_group_primary_type_, …) — the root cause of the
+  FK-less load-target decision (module header of `src/mbdb/import.rs`).
+- Counts below spot-verified against the full export expectations (e.g. `release_group_primary_type`
+  = 5, `release_status` = 7, `release_packaging` = 24).
+
+### §R2 — P0 smoke import (milestone-1 step 3)
+
+- Reference:`mbdb import --tables core --dump-dir <dumps-sample> --db smoke.duckdb`
+  (`target/release/mbdb`, single pass, constant memory: peak RSS not instrumented).
+- **Duration: 16m02s** wall for the smoke set (1.7 GB decompressed, ~11.8 M pinned rows) — the full
+  export at ~7 GB raw should land within the plan's 30–180 min budget.
+- Loaded **51 tables, 14,669,585 rows** (all pinned members present): zero rejections, checkpoint
+  totals identical to table row counts, `referential integrity: CLEAN` (zero orphans across every
+  manifest FK edge). Per-table counts:
+
+  | table | rows | table | rows |
+  |---|---|---|---|
+  | area | 17 867 | isrc | 644 959 |
+  | area_gid_redirect | 69 | iswc | 69 115 |
+  | artist | 262 044 | l_artist_recording | 1 945 209 |
+  | artist_alias | 158 782 | l_artist_release | 15 962 |
+  | artist_credit | 292 775 | l_artist_release_group | 162 |
+  | artist_credit_gid_redirect | 8 499 | l_artist_url | 41 977 |
+  | artist_credit_name | 672 097 | l_artist_work | 371 213 |
+  | artist_gid_redirect | 40 945 | l_label_release | 6 748 |
+  | label | 24 677 | l_recording_release | 85 |
+  | label_gid_redirect | 3 958 | l_recording_url | 141 839 |
+  | link | 256 940 | l_recording_work | 2 764 609 |
+  | link_attribute_type | 1 169 | l_release_group_url | 1 306 |
+  | link_type | 697 | l_release_url | 6 901 |
+  | medium | 48 281 | l_url_work | 56 950 |
+  | recording | 2 979 704 | release | 29 281 |
+  | recording_alias | 410 371 | release_country | 51 641 |
+  | recording_gid_redirect | 1 818 388 | release_gid_redirect | 4 132 |
+  | release_group | 23 132 | release_label | 34 063 |
+  | release_group_alias | 2 609 | release_packaging | 24 |
+  | release_group_gid_redirect | 10 658 | release_status | 7 |
+  | release_group_primary_type | 5 | release_unknown_country | 1 757 |
+  | release_group_secondary_type | 12 | track | 584 064 |
+  | release_group_secondary_type_join | 7 947 | url | 228 611 |
+  | work | 245 164 | url_gid_redirect | 919 |
+  | work_alias | 62 079 | work_gid_redirect | 99 403 |
+
+  (sum matches the checkpoint file; `duckdb_tables()` + `count(*)` cross-checked 2026-10-01.)
+
+- **Deviation from plan (verified against the actual 2026-10-01 sample):** §3 states dump booleans are
+  `t`/`f`; the shipped dump renders every boolean (`ended`, `video`, `is_data_track`,
+  `primary_for_locale`, …) as **`0`/`1`** — zero `t`/`f` values appear in any member (grep-verified
+  across `track`, `recording`, `artist`, `area`, `link`, `isrc`, `release_group_secondary_type_join`).
+  `tsv::parse_bool` therefore accepts `0`/`1` (canonical for schema-31 exports) and keeps `t`/`f` as
+  legacy tolerance. The first smoke attempt (parser accepting only `t`/`f`) rejected ~4.5 M rows on
+  exactly the boolean columns; the fixed run above is rejection-free.
+- Also spot-verified against the dump while diagnosing: `track` gained `is_data_track` (12 columns,
+  in the manifest), aliases keep a `sort_name` column in the export (16 columns), and `artist` peaks at
+  19 columns — the pinned manifests match the shipped members field-for-field.
