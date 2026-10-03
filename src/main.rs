@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use mbdb::config::{CliOverrides, Config, DEFAULT_CONFIG_PATH, Settings};
 use mbdb::import::{LoadReport, load, rejections_path, verify_integrity};
-use mbdb::query::{QueryOptions, query_artist};
+use mbdb::query::{QueryOptions, query_artist, query_release_group};
 
 /// The mbdb command-line interface.
 #[derive(Debug, Parser)]
@@ -51,6 +51,29 @@ enum QueryKind {
     /// Query artists by name (exact first, then sort_name/alias, then
     /// substring) with aliases and disambiguation surfaced.
     Artist(ArtistArgs),
+    /// Query release groups by name with types, first-release-date, and
+    /// artist credit.
+    ReleaseGroup(ReleaseGroupArgs),
+}
+
+/// Arguments for `mbdb query release-group`.
+#[derive(Debug, Args)]
+struct ReleaseGroupArgs {
+    /// Release-group name to search for (case-sensitive).
+    #[arg(long, value_name = "NAME")]
+    name: String,
+
+    /// Filter by artist credit name (case-sensitive substring).
+    #[arg(long, value_name = "NAME")]
+    artist: Option<String>,
+
+    /// Filter by primary type name (exact, e.g. Album, Single, EP).
+    #[arg(long, value_name = "TYPE")]
+    rg_type: Option<String>,
+
+    /// Cap the number of matches printed (default: all).
+    #[arg(long, value_name = "N")]
+    limit: Option<usize>,
 }
 
 /// Arguments for `mbdb query artist`.
@@ -129,25 +152,46 @@ fn run_query(args: &QueryArgs) {
             std::process::exit(1);
         }
     };
-    let result = match &args.kind {
+    match &args.kind {
         QueryKind::Artist(artist) => {
             let options = QueryOptions {
                 limit: artist.limit,
             };
-            query_artist(&conn, &artist.name, &options)
+            let result = query_artist(&conn, &artist.name, &options);
+            let result = match result {
+                Ok(r) => r,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(1);
+                }
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_owned())
+            );
         }
-    };
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => {
-            eprintln!("error: {error}");
-            std::process::exit(1);
+        QueryKind::ReleaseGroup(rg) => {
+            let options = QueryOptions { limit: rg.limit };
+            let result = query_release_group(
+                &conn,
+                &rg.name,
+                rg.artist.as_deref(),
+                rg.rg_type.as_deref(),
+                &options,
+            );
+            let result = match result {
+                Ok(r) => r,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(1);
+                }
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_owned())
+            );
         }
-    };
-    println!(
-        "{}",
-        serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_owned())
-    );
+    }
 }
 
 fn run_import(args: &ImportArgs) {
