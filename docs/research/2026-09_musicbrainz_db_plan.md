@@ -1,7 +1,7 @@
 # Research: MusicBrainz Database for tag_agent (Option 1 — separate DB)
 
 **Date:** 2026-09-30
-**Status:** Proposed — reviewed 2026-09-30 (facts verified against the 2026-09-01 sample dump); corrections applied; not yet implemented.
+**Status:** **Implemented (M1)** — closed 2026-10-03; battery measured (§R4). Reviewed 2026-09-30 (facts verified against the 2026-09-01 sample dump); corrections applied.
 **Decision source:** `tag_agent/docs/ARCHITECTURE-proposal.md`, D10 (added 2026-09-30) — the tag agent will add a
 MusicBrainz evidence source per **Option 1**: a *separate* MusicBrainz-derived database, built by a new repo
 `music_db_mb`, leaving the existing wiki DB (`~/wiki_db/music.duckdb`) untouched.
@@ -208,17 +208,17 @@ surface), wiki-DB reconciliation via the Wikidata link tables, Levenshtein/dista
 Run against `musicbrainz.duckdb` after Step 4. Goldens codify *verified facts* from the live sources; any
 measured mismatch is recorded with root cause (never tuned around):
 
-| # | Check | Expect | Measured at run (fill in) |
+| # | Check | Expect | Measured at run (2026-10-03, musicbrainz.duckdb 2026-09-30-002222) |
 | --- | --- | --- | --- |
-| 1 | Import completeness | Imported rows == source-file inventory rows per table (recorded) | |
-| 2 | `query artist --name U2` | Exact-match band U2 **first**; disambiguation "Irish rock band"; aliases surfaced (e.g. 유투) | |
-| 3 | `query release-group --name "The Joshua Tree"` | RG = Album, first-release-date 1987-03-09, artist-credit U2 | |
-| 4 | `query release --release-group <that RG> --inc tracks` | 11 tracks; #1 "Where the Streets Have No Name" ≈ 337.5 s; #3 "With or Without You" | |
-| 5 | `query release-group --name "Avenue Q"` | ≥ 1 RG including "Avenue Q: The Musical" (Soundtrack, 2003-10-06); other Avenue Q RGs present | |
-| 6 | `query release-group --name Ragtime` | RG list incl. "Ragtime" (1981 film) or "Ragtime (musical)" if present — record coverage verdict per corpus dir | |
-| 7 | Wikidata bridge | `url` + `l_*_url` rows with `link_type` = wikidata > 0 for artist/release_group/work; `query wikidata --mbid 6f3e9fa6-…` resolves The Joshua Tree to its `https://www.wikidata.org/wiki/Q…` | |
-| 8 | Corpus spot-checks | For each `/home/tr/mp3_files/` dir, record the top 1-3 sensible RG hits; list any dir with **no** evidence as a finding (both sources may miss long-tail — measured, not tuned around) | |
-| 9 | CLI contract | JSON outputs parse against the §4 snapshot goldens; exact-match-first ordering verified incl. >100-row spillover case | |
+| 1 | Import completeness | Imported rows == source-file inventory rows per table (recorded) | PASS — 50 tables, 248 267 192 rows, checkpoint == per-table `count(*)`; zero rejections; referential integrity CLEAN (79 FK edges). Independently re-verified 2026-10-03 (§R3) |
+| 2 | `query artist --name U2` | Exact-match band U2 **first**; disambiguation "Irish rock band"; aliases surfaced (e.g. 유투) | PASS — U2 first (`a3cb23fc-…`); disambiguation "Irish rock band"; aliases incl. 유투 (55 total, untruncated) |
+| 3 | `query release-group --name "The Joshua Tree"` | RG = Album, first-release-date 1987-03-09, artist-credit U2 | PASS (date nuance) — exact RG first, types [Album], credit [U2]; first-release-date measured **1987-01-01**, not 1987-03-09: country rows with only `date_year` = 1987 render 01-01 (COALESCE convention) and the MIN spans all releases of the group. Recorded, not tuned |
+| 4 | `query release --release-group <that RG> --inc tracks` | 11 tracks; #1 "Where the Streets Have No Name" ≈ 337.5 s; #3 "With or Without You" | PASS — 65 releases of the RG all surfaced; canonical 1987-03-09 UK release (`9d990576-…`) has 11 tracks; #1 track.length 337 973 ms → **337.973 s** (recording.length canonical = 337 520 ms → 337.52 s ≈ the expectation); #3 "With or Without You" 296.16 s |
+| 5 | `query release-group --name "Avenue Q"` | ≥ 1 RG incl. "Avenue Q: The Musical" (Soundtrack, 2003-10-06); other Avenue Q RGs present | PASS (date nuance) — 4 RGs incl. "Avenue Q: The Musical" [Album, Soundtrack] (2003-01-01 — partial-year rendering) |
+| 6 | `query release-group --name Ragtime` | RG list incl. "Ragtime" (1981 film) or "Ragtime (musical)" if present — record coverage verdict per corpus dir | PASS — 297 RGs; top "Ragtime" [Album, Soundtrack] 1981-01-01 (motion-picture soundtrack present). Corpus-dir verdicts in §R4 |
+| 7 | Wikidata bridge | `url` + `l_*_url` rows with `link_type` = wikidata > 0 for artist/release_group/work; `query wikidata --mbid 6f3e9fa6-…` resolves The Joshua Tree to its QID | PASS — wikidata link rows: artist 289 381, release_group 184 290, work 51 544 (`l_url_work`). Verified bridges: artist → **Q396** (U2), release_group 6f3e9fa6-be7a-… → **Q152873** (The Joshua Tree), work c90fe41d-… → **Q1131812** (With or Without You) |
+| 8 | Corpus spot-checks | For each `/home/tr/mp3_files/` dir, record the top 1-3 sensible RG hits; list any dir with **no** evidence as a finding | See §R4 — 8 of 12 dirs have exact-name RGs; 4 findings (obscure / title-variant names); Spamalot resolves via its short name (7 RGs) though the corpus dir name does not |
+| 9 | CLI contract | JSON outputs parse against the §4 snapshot goldens; exact-match-first ordering verified incl. >100-row spillover case | PASS — 6 golden snapshots byte-match in `cargo test`; >100-row spillover exercised live: `release-group --name The` → 378 708 matches untruncated; artist `U2` → 55 |
 
 ## 9. Pitfalls
 
@@ -390,3 +390,54 @@ results, refresh-cycle record) per the house documentation conventions.
     | label_gid_redirect                      9,110 | work_alias                            162,582 |
     | link                                1,150,983 | work_gid_redirect                     159,609 |
   ```
+
+
+### §R4 — M1 battery results and close-out (2026-10-03)
+
+Closed via commits `454b20f` (fix: `release_group_secondary_type_join` natural-key ordering —
+the only query-vs-real-schema mismatch, caught by the real-schema smoke suite added in the
+same commit) → `4559ce6` release → `d9519ca` recording → `b95e964` work → `72a55db` wikidata
+→ `4524c36` ARCHITECTURE.md (+AGENTS.md) → the battery close-out commit (this
+section, 2026-10-03).
+Verify gate green at every commit: `cargo test` (129 tests: 121 lib + 8 smoke) → `cargo
+clippy --all-targets --all-features -- -D warnings` zero warnings → `cargo fmt --check`
+clean → `cargo build --release` succeeds.
+
+Run against `~/musicbrainz_db/musicbrainz.duckdb` (2026-09-30-002222 export, 50 tables,
+248 267 192 rows). **All 9 battery items PASS**, three with recorded nuances (no tuning):
+
+- **Partial dates render `YYYY-01-01`** — a country row with year-only is COALESCEd to
+  month/day 01 (the release-group convention). This is why the Joshua Tree / Avenue Q RG
+  first-release dates measure 1987-01-01 / 2003-01-01 instead of the musicbrainz.org
+  1987-03-09 / 2003-10-06, and why the RG-level MIN prefers a year-only release. The dates
+  are the shipped data; the render convention is documented, not tuned.
+- **Track vs recording duration** — the canonical UK release's track 1 `track.length`
+  = 337 973 ms → 337.973 s; the canonical `recording.length` = 337 520 ms → 337.52 s ≈ the
+  plan's ≈337.5 s expectation. The contract exposes the actual per-release track length.
+- **Recording first-release dates are sparse** — `l_recording_release` ships only 1 345
+  rows (established §R3), so `recording.first_release_date` is `None` for nearly all
+  recordings. Surfaced as-is, never estimated.
+
+Corpus spot-checks (battery 8; `release-group --name "<dir>" --limit 3`, top-of-list):
+
+| Corpus dir | Verdict (top RGs) |
+|---|---|
+| Annie | PASS — "Annie" [Album] 1999-11-09, [Album,Soundtrack] 1972-01-01, … |
+| Avenue Q | PASS — "Avenue Q: The Musical" [Album,Soundtrack] 2003-01-01 + 3 more Avenue Q RGs (the wiki DB had **zero**) |
+| Duke Ellington | PASS — "Duke Ellington" [Album,Compilation] (top-exact) |
+| Erykah Badu | PASS — exact "Erykah Badu" [Single] + very-close variants |
+| **Gay Men's Chorus of Los Angeles** | **FINDING** — no exact-name RG (long tail; first word "Gay" is unactionable; MB likely only has releases under the chorus + orchestra label variant) |
+| **James Kelly, Paddy O'Brien, Daithi Sproule** | **FINDING** — no exact-name RG; word-level hits are unrelated. Traditional Irish group; check `db_layer` name fallbacks later |
+| **Ragtime, Music From The Motion Picture** | **FINDING (title variant)** — no RG under the exact corpus title, but `Ragtime` itself surfaces "Ragtime" [Album,Soundtrack] 1981-01-01 (battery 6) |
+| Rossini | PASS — exact "Rossini" RGs first |
+| **Shakers of Sabbathday Lake** | **FINDING** — no exact-name RG (obscure domestic ensemble; "Shakers" alone has no sensible exact hit) |
+| **Spamalot, 2005 Broadway** | **FINDING (title variant)** — no RG under the exact corpus name, but "Spamalot" resolves 7 RGs incl. "Spamalot" [Album,Soundtrack] and "Monty Python's Spamalot" [Album,Soundtrack] 2005-01-01 — evidence MB has the cast recordings the wiki DB cannot (zero Spamalot rows there) |
+| U2 | PASS — U2 RGs incl. exact "U2" [Single] and the canonical 1987-03-09 group |
+| Vivaldi, The Four Seasons | PASS — exact "Vivaldi, The Four Seasons" [Album] groups |
+
+8 of 12 dirs have direct evidence; the 4 findings are long-tail/title-variant misses in
+both sources — recorded, not tuned (plan §8's "measured, not tuned around" rule).
+
+Tag_agent integration (`db_layer.py`) and wiki-DB reconciliation via the wikidata bridge
+remain out of scope (later phases, plan §10). The refresh cycle (weekly rebuild + atomic
+swap) is documented in ARCHITECTURE.md §4.1/§5.

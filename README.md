@@ -4,7 +4,9 @@ Builds and serves a local DuckDB of MusicBrainz metadata for the tag_agent proje
 **Option 1** of the tag_agent architecture: a *separate* MusicBrainz-derived database that
 complements (never replaces) the wiki-based database.
 
-**Status:** planning — see `docs/research/2026-09_musicbrainz_db_plan.md` (Proposed, 2026-09-30).
+**Status:** **implemented (M1)** — DB + query surface live (`~/musicbrainz_db/musicbrainz.duckdb`,
+2026-09-30-002222 export); battery measured 2026-10-03 (run notes §R4). See
+[`docs/research/2026-09_musicbrainz_db_plan.md`](docs/research/2026-09_musicbrainz_db_plan.md) (status: Implemented).
 
 ## What this repo does
 
