@@ -9,7 +9,7 @@ use duckdb::Connection;
 
 use mbdb::manifest::{ALL, table};
 use mbdb::query::{
-    QueryOptions, query_artist, query_recording, query_release, query_release_group,
+    QueryOptions, query_artist, query_recording, query_release, query_release_group, query_work,
 };
 use mbdb::schema::{create_schema, ddl};
 
@@ -200,7 +200,22 @@ fn seed_query_tables(conn: &mut Connection) {
          INSERT INTO link (id, link_type) VALUES
             (1, 1);
          INSERT INTO l_recording_release (id, link, entity0, entity1) VALUES
-            (1, 1, 1, 1);"
+            (1, 1, 1, 1);
+         INSERT INTO work (id, gid, name, type) VALUES
+            (1, 'work-gid-1', 'With or Without You', 17);
+         INSERT INTO work_alias (id, work, name, sort_name, locale,
+                                 primary_for_locale) VALUES
+            (1, 1, 'WOWY', 'WOWY', NULL, FALSE);
+         INSERT INTO iswc (id, work, iswc) VALUES
+            (1, 1, 'T-011.336.805-0');
+         INSERT INTO link_type (id, gid, entity_type0, entity_type1, name,
+                                link_phrase, reverse_link_phrase, long_link_phrase) VALUES
+            (2, 'lt-composer-gid', 'artist', 'work', 'composer',
+             'composed', 'composed by', 'composed');
+         INSERT INTO link (id, link_type) VALUES
+            (2, 2);
+         INSERT INTO l_artist_work (id, link, entity0, entity1) VALUES
+            (1, 2, 1, 1);"
     )
     .unwrap();
 }
@@ -302,5 +317,45 @@ fn smoke_recording_query_binds_to_real_schema() {
     let filtered = query_recording(&conn, "Where", Some("U2"), &QueryOptions::default()).unwrap();
     assert_eq!(filtered.matches.len(), 1);
     let none = query_recording(&conn, "Where", Some("Nobody"), &QueryOptions::default()).unwrap();
+    assert!(none.matches.is_empty());
+}
+
+#[test]
+fn smoke_work_query_binds_to_real_schema() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    create_schema(&mut conn).unwrap();
+    seed_query_tables(&mut conn);
+
+    // The work query binds to the real column set: name gate, alias
+    // join, iswc, the omitted work_type name table (raw type id
+    // surfaces), and the composer link chain through
+    // link_type/link/l_artist_work (entity0 = artist, entity1 = work).
+    let result = query_work(&conn, "With or Without You", None, &QueryOptions::default()).unwrap();
+    assert_eq!(result.matches.len(), 1);
+    let hit = &result.matches[0];
+    assert_eq!(hit.mbid, "work-gid-1");
+    assert_eq!(hit.work_type.expect("work type"), 17);
+    assert_eq!(hit.iswc, vec!["T-011.336.805-0"]);
+    assert_eq!(hit.composers.len(), 1);
+    assert_eq!(hit.composers[0].name, "U2");
+    assert_eq!(hit.aliases.len(), 1);
+    assert_eq!(hit.aliases[0].name, "WOWY");
+
+    // The --composer filter binds (link_type name = 'composer').
+    let filtered = query_work(
+        &conn,
+        "With or Without You",
+        Some("U2"),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(filtered.matches.len(), 1);
+    let none = query_work(
+        &conn,
+        "With or Without You",
+        Some("Nobody"),
+        &QueryOptions::default(),
+    )
+    .unwrap();
     assert!(none.matches.is_empty());
 }

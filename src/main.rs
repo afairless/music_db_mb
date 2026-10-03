@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use mbdb::config::{CliOverrides, Config, DEFAULT_CONFIG_PATH, Settings};
 use mbdb::import::{LoadReport, load, rejections_path, verify_integrity};
 use mbdb::query::{
-    QueryOptions, query_artist, query_recording, query_release, query_release_group,
+    QueryOptions, query_artist, query_recording, query_release, query_release_group, query_work,
 };
 
 /// The mbdb command-line interface.
@@ -62,6 +62,24 @@ enum QueryKind {
     /// Query recordings by name with durations (ms → s), first release
     /// date, and artist credit.
     Recording(RecordingArgs),
+    /// Query works by name with ISWCs, raw type, and composer links.
+    Work(WorkArgs),
+}
+
+/// Arguments for `mbdb query work`.
+#[derive(Debug, Args)]
+struct WorkArgs {
+    /// Work name to search for (case-sensitive).
+    #[arg(long, value_name = "NAME")]
+    name: String,
+
+    /// Filter by composer artist name (case-sensitive substring).
+    #[arg(long, value_name = "NAME")]
+    composer: Option<String>,
+
+    /// Cap the number of matches printed (default: all).
+    #[arg(long, value_name = "N")]
+    limit: Option<usize>,
 }
 
 /// Arguments for `mbdb query recording`.
@@ -249,6 +267,18 @@ fn run_query(args: &QueryArgs) {
                 recording.artist.as_deref(),
                 &options,
             );
+            let result = match result {
+                Ok(r) => r,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(1);
+                }
+            };
+            emit_json(&result);
+        }
+        QueryKind::Work(work) => {
+            let options = QueryOptions { limit: work.limit };
+            let result = query_work(&conn, &work.name, work.composer.as_deref(), &options);
             let result = match result {
                 Ok(r) => r,
                 Err(error) => {

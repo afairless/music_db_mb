@@ -1621,6 +1621,345 @@ fn fetch_recording_aliases(
     Ok(out)
 }
 
+/// A matched work (contract shape, plan §4).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkHit {
+    pub kind: &'static str,
+    pub name: String,
+    /// The work `gid`, exposed as `mbid`.
+    pub mbid: String,
+    /// Raw `work.type` FK as shipped. The name table (`work_type`) is
+    /// not part of the imported subset (schema 31 ships no member), so
+    /// the pin surfaces the opaque id rather than guessing a name.
+    pub work_type: Option<i32>,
+    /// ISWCs for the work, ordered by iswc id.
+    pub iswc: Vec<String>,
+    /// Artists linked to the work with link_type `composer`, ordered by
+    /// link junction id.
+    pub composers: Vec<ArtistCreditEntry>,
+    /// All of the work's aliases, ordered by alias id.
+    pub aliases: Vec<AliasHit>,
+}
+
+/// Query works by name (plan §4.`query work --name [--composer]`).
+///
+/// Match tiers (same contract as the recording query):
+///
+/// 0. exact `name`
+/// 1. exact alias
+/// 2. substring `name`
+/// 3. substring alias
+///
+/// Optional `--composer` filters to works whose `composer`-typed artist
+/// link matches (exact or substring on the artist name).
+pub fn query_work(
+    conn: &Connection,
+    name: &str,
+    composer: Option<&str>,
+    options: &QueryOptions,
+) -> Result<QueryResult<WorkHit>, QueryError> {
+    let query = name.trim();
+    if query.is_empty() {
+        return Err(QueryError::EmptyQuery);
+    }
+
+    // Gate 1 — work rows matching on name.
+    let mut candidate_ids: HashSet<i64> = HashSet::new();
+    {
+        let sql = "SELECT id FROM work                    WHERE name = ?1 OR contains(name, ?2)";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![query, query], |row| row.get::<_, i64>(0))?;
+        for id in rows {
+            candidate_ids.insert(id?);
+        }
+    }
+
+    // Gate 2 — alias rows matching the query.
+    let mut alias_exact: HashSet<i64> = HashSet::new();
+    let mut alias_substring: HashSet<i64> = HashSet::new();
+    {
+        let sql = "SELECT work, name FROM work_alias                    WHERE name = ?1 OR contains(name, ?2)";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![query, query], |row| {
+            let work: i64 = row.get(0)?;
+            let alias: String = row.get(1)?;
+            Ok((work, alias))
+        })?;
+        for row in rows {
+            let (work, alias) = row?;
+            if alias == query {
+                alias_exact.insert(work);
+            }
+            if alias.contains(query) {
+                alias_substring.insert(work);
+            }
+        }
+    }
+
+    candidate_ids.extend(alias_exact.iter().copied());
+    candidate_ids.extend(alias_substring.iter().copied());
+    if candidate_ids.is_empty() {
+        return Ok(QueryResult {
+            kind: "work",
+            query: query.to_owned(),
+            matches: Vec::new(),
+        });
+    }
+
+    // Filter by --composer (artist linked with link_type `composer`).
+    if let Some(composer_filter) = composer {
+        let trimmed = composer_filter.trim();
+        if !trimmed.is_empty() {
+            let ids = candidate_ids.into_iter().collect::<Vec<_>>();
+            let mut filtered: HashSet<i64> = HashSet::new();
+            let in_clause = in_placeholders(ids.len());
+            let sql = format!(
+                "SELECT DISTINCT w.id \
+         FROM work w \
+         JOIN l_artist_work law ON law.entity1 = w.id \
+         JOIN link l ON law.link = l.id \
+         JOIN link_type lt ON l.link_type = lt.id \
+         JOIN artist a ON law.entity0 = a.id \
+         WHERE w.id IN ({}) AND lt.name = 'composer' \
+         AND (a.name = ? OR contains(a.name, ?))",
+                in_clause
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut all_params: Vec<duckdb::types::Value> = Vec::new();
+            for id in ids {
+                all_params.push(duckdb::types::Value::BigInt(id));
+            }
+            all_params.push(duckdb::types::Value::Text(trimmed.to_string()));
+            all_params.push(duckdb::types::Value::Text(trimmed.to_string()));
+            let rows = stmt.query_map(params_from_iter(all_params.iter()), |row| {
+                row.get::<_, i64>(0)
+            })?;
+            for id in rows {
+                filtered.insert(id?);
+            }
+            candidate_ids = filtered;
+            if candidate_ids.is_empty() {
+                return Ok(QueryResult {
+                    kind: "work",
+                    query: query.to_owned(),
+                    matches: Vec::new(),
+                });
+            }
+        }
+    }
+
+    // Fetch the full rows for every candidate id.
+    let ids: Vec<i64> = candidate_ids.into_iter().collect();
+    let mut rows = fetch_work_rows(conn, &ids)?;
+    for row in rows.iter_mut() {
+        row.rank = if row.name == query {
+            TIER_NAME_EXACT
+        } else if alias_exact.contains(&row.id) {
+            TIER_ALIAS_EXACT
+        } else if row.name.contains(query) {
+            TIER_NAME_SUBSTRING
+        } else {
+            TIER_ALIAS_SUBSTRING
+        };
+    }
+
+    // Deterministic order: tier, then name, then id (stable tiebreaker).
+    rows.sort_by(|a, b| (a.rank, a.name.as_str(), a.id).cmp(&(b.rank, b.name.as_str(), b.id)));
+    if let Some(limit) = options.limit {
+        rows.truncate(limit);
+    }
+
+    // Batch-fetch the extra columns for the surfaced hits.
+    let hit_ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+    let iswcs = fetch_work_iswcs(conn, &hit_ids)?;
+    let composers = fetch_work_composers(conn, &hit_ids)?;
+    let aliases = fetch_work_aliases(conn, &hit_ids)?;
+
+    let matches = rows
+        .into_iter()
+        .map(|row| {
+            let iswc_vec: Vec<String> = match iswcs.get(&row.id) {
+                Some(v) => v.clone(),
+                None => Vec::new(),
+            };
+            let composer_vec: Vec<ArtistCreditEntry> = match composers.get(&row.id) {
+                Some(v) => v.clone(),
+                None => Vec::new(),
+            };
+            let alias_vec: Vec<AliasHit> = match aliases.get(&row.id) {
+                Some(v) => v.clone(),
+                None => Vec::new(),
+            };
+            WorkHit {
+                kind: "work",
+                name: row.name.clone(),
+                mbid: row.gid.clone(),
+                work_type: row.work_type,
+                iswc: iswc_vec,
+                composers: composer_vec,
+                aliases: alias_vec,
+            }
+        })
+        .collect();
+
+    Ok(QueryResult {
+        kind: "work",
+        query: query.to_owned(),
+        matches,
+    })
+}
+
+/// Ranked work candidate row (internal).
+struct WorkCandidate {
+    id: i64,
+    gid: String,
+    name: String,
+    work_type: Option<i32>,
+    rank: u8,
+}
+
+/// Fetch work rows for the given ids.
+fn fetch_work_rows(conn: &Connection, ids: &[i64]) -> Result<Vec<WorkCandidate>, QueryError> {
+    let sql = format!(
+        "SELECT id, gid, name, type FROM work WHERE id IN ({})",
+        in_placeholders(ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params_from_iter(ids.iter().map(|id| duckdb::types::Value::BigInt(*id))),
+        |row| {
+            Ok(WorkCandidate {
+                id: row.get(0)?,
+                gid: row.get(1)?,
+                name: row.get(2)?,
+                work_type: row.get::<_, Option<i32>>(3)?,
+                rank: 0,
+            })
+        },
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Map from work id to its ISWCs (ordered by iswc id).
+fn fetch_work_iswcs(
+    conn: &Connection,
+    work_ids: &[i64],
+) -> Result<std::collections::BTreeMap<i64, Vec<String>>, QueryError> {
+    let mut out: std::collections::BTreeMap<i64, Vec<String>> = Default::default();
+    if work_ids.is_empty() {
+        return Ok(out);
+    }
+    let sql = format!(
+        "SELECT work, iswc FROM iswc WHERE work IN ({}) ORDER BY id",
+        in_placeholders(work_ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params_from_iter(work_ids.iter().map(|id| duckdb::types::Value::BigInt(*id))),
+        |row| {
+            let work_id: i64 = row.get(0)?;
+            let iswc: String = row.get(1)?;
+            Ok((work_id, iswc))
+        },
+    )?;
+    for row in rows {
+        let (work_id, iswc) = row?;
+        out.entry(work_id).or_default().push(iswc);
+    }
+    Ok(out)
+}
+
+/// Map from work id to its composers (artists linked with link_type
+/// `composer`), ordered by link junction id.
+fn fetch_work_composers(
+    conn: &Connection,
+    work_ids: &[i64],
+) -> Result<std::collections::BTreeMap<i64, Vec<ArtistCreditEntry>>, QueryError> {
+    let mut out: std::collections::BTreeMap<i64, Vec<ArtistCreditEntry>> = Default::default();
+    if work_ids.is_empty() {
+        return Ok(out);
+    }
+    let sql = format!(
+        "SELECT w.id AS work_id, a.name AS artist_name, a.gid, a.comment \
+         FROM work w \
+         JOIN l_artist_work law ON law.entity1 = w.id \
+         JOIN link l ON law.link = l.id \
+         JOIN link_type lt ON l.link_type = lt.id \
+         JOIN artist a ON law.entity0 = a.id \
+         WHERE w.id IN ({}) AND lt.name = 'composer' \
+         ORDER BY w.id, law.id",
+        in_placeholders(work_ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params_from_iter(work_ids.iter().map(|id| duckdb::types::Value::BigInt(*id))),
+        |row| {
+            let work_id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            let gid: String = row.get(2)?;
+            let comment: Option<String> = row.get::<_, Option<String>>(3)?;
+            Ok((
+                work_id,
+                ArtistCreditEntry {
+                    name,
+                    mbid: gid,
+                    disambiguation: comment.unwrap_or_default(),
+                },
+            ))
+        },
+    )?;
+    for row in rows {
+        let (work_id, entry) = row?;
+        out.entry(work_id).or_default().push(entry);
+    }
+    Ok(out)
+}
+
+/// Map from work id to its aliases (ordered by alias id).
+fn fetch_work_aliases(
+    conn: &Connection,
+    work_ids: &[i64],
+) -> Result<std::collections::BTreeMap<i64, Vec<AliasHit>>, QueryError> {
+    let mut out: std::collections::BTreeMap<i64, Vec<AliasHit>> = Default::default();
+    if work_ids.is_empty() {
+        return Ok(out);
+    }
+    let sql = format!(
+        "SELECT work, name, locale, primary_for_locale \
+         FROM work_alias \
+         WHERE work IN ({}) \
+         ORDER BY id",
+        in_placeholders(work_ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params_from_iter(work_ids.iter().map(|id| duckdb::types::Value::BigInt(*id))),
+        |row| {
+            let work_id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            let locale: Option<String> = row.get(2)?;
+            let primary_for_locale: bool = row.get(3)?;
+            Ok((
+                work_id,
+                AliasHit {
+                    name,
+                    locale,
+                    primary_for_locale,
+                },
+            ))
+        },
+    )?;
+    for row in rows {
+        let (work_id, alias) = row?;
+        out.entry(work_id).or_default().push(alias);
+    }
+    Ok(out)
+}
+
 /// Build `?,?,?,…` for an `IN` clause.
 fn in_placeholders(count: usize) -> String {
     vec!["?"; count].join(", ")
@@ -2715,6 +3054,218 @@ mod tests {
         let actual = serde_json::to_string(&result).unwrap();
         let expected =
             fs::read_to_string(golden_path("query_recording_where_the_streets.json")).unwrap();
+        assert_eq!(format!("{actual}\n"), expected);
+    }
+    // ------------------------------------------------------------------ //
+    //  Work query tests                                                 //
+    // ------------------------------------------------------------------ //
+
+    /// In-memory DuckDB mirroring the loader's target surface for the
+    /// work query (pinned schema-31 column sets; the canonical work
+    /// uses the shipped gid, type, ISWCs, and composer links).
+    fn work_fixture_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE artist (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL,
+                 sort_name VARCHAR NOT NULL,
+                 comment VARCHAR NOT NULL DEFAULT ''
+             );
+             CREATE TABLE work (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL,
+                 type INTEGER,
+                 comment VARCHAR NOT NULL DEFAULT ''
+             );
+             CREATE TABLE work_alias (
+                 id INTEGER PRIMARY KEY,
+                 work INTEGER NOT NULL,
+                 name VARCHAR NOT NULL,
+                 sort_name VARCHAR NOT NULL,
+                 locale VARCHAR,
+                 primary_for_locale BOOLEAN NOT NULL DEFAULT FALSE
+             );
+             CREATE TABLE iswc (
+                 id INTEGER PRIMARY KEY,
+                 work INTEGER NOT NULL,
+                 iswc VARCHAR
+             );
+             CREATE TABLE link_type (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 entity_type0 VARCHAR NOT NULL,
+                 entity_type1 VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL,
+                 link_phrase VARCHAR NOT NULL,
+                 reverse_link_phrase VARCHAR NOT NULL,
+                 long_link_phrase VARCHAR NOT NULL
+             );
+             CREATE TABLE link (
+                 id INTEGER PRIMARY KEY,
+                 link_type INTEGER NOT NULL
+             );
+             CREATE TABLE l_artist_work (
+                 id INTEGER PRIMARY KEY,
+                 link INTEGER NOT NULL,
+                 entity0 INTEGER NOT NULL,
+                 entity1 INTEGER NOT NULL
+             );
+             INSERT INTO artist (id, gid, name, sort_name, comment) VALUES
+                (1, 'adam-clayton-gid', 'Adam Clayton', 'Clayton, Adam', ''),
+                (2, 'bono-gid', 'Bono', 'Bono', ''),
+                (3, 'larry-mullen-gid', 'Larry Mullen Jr.', 'Mullen, Larry, Jr.', ''),
+                (4, 'edge-gid', 'The Edge', 'Edge, The', '');
+             INSERT INTO work (id, gid, name, type, comment) VALUES
+                (172336, 'c90fe41d-9409-377b-aa32-3d0730d0e865', 'With or Without You', 17, ''),
+                (700001, 'work-live-gid', 'With or Without You (live)', 17, ''),
+                (700002, 'work-symphony-gid', 'Symphony No. 1', NULL, '');
+             INSERT INTO work_alias (id, work, name, sort_name, locale, primary_for_locale) VALUES
+                (1, 172336, 'WOWY', 'WOWY', NULL, FALSE);
+             INSERT INTO iswc (id, work, iswc) VALUES
+                (1, 172336, 'T-011.336.805-0'),
+                (2, 172336, 'T-011.245.656-0'),
+                (3, 172336, 'T-925.518.827-3');
+             INSERT INTO link_type (id, gid, entity_type0, entity_type1, name,
+                                     link_phrase, reverse_link_phrase, long_link_phrase) VALUES
+                (1, 'lt-composer-gid', 'artist', 'work', 'composer',
+                 'composed', 'composed by', 'composed'),
+                (2, 'lt-lyricist-gid', 'artist', 'work', 'lyricist',
+                 'wrote lyrics', 'lyrics written by', 'wrote lyrics');
+             INSERT INTO link (id, link_type) VALUES
+                (1, 1), (2, 1), (3, 1), (4, 1), (5, 2);
+             INSERT INTO l_artist_work (id, link, entity0, entity1) VALUES
+                (1, 1, 1, 172336),
+                (2, 2, 2, 172336),
+                (3, 3, 3, 172336),
+                (4, 4, 4, 172336),
+                (5, 5, 2, 172336);",
+        )
+        .expect("seed work fixture");
+        conn
+    }
+
+    #[test]
+    fn work_exact_name_first_with_type_and_iswc() {
+        let conn = work_fixture_conn();
+        let result =
+            query_work(&conn, "With or Without You", None, &QueryOptions::default()).unwrap();
+        // Exact-name first; the live variant is a substring tier hit.
+        assert_eq!(result.matches.len(), 2);
+        let first = &result.matches[0];
+        assert_eq!(first.name, "With or Without You");
+        assert_eq!(first.mbid, "c90fe41d-9409-377b-aa32-3d0730d0e865");
+        assert_eq!(first.work_type.expect("work type"), 17);
+        assert_eq!(
+            first.iswc,
+            vec!["T-011.336.805-0", "T-011.245.656-0", "T-925.518.827-3"]
+        );
+        // Lyricist links are not composers; composer order is the link
+        // junction order.
+        assert_eq!(first.composers.len(), 4);
+        assert_eq!(first.composers[0].name, "Adam Clayton");
+        assert_eq!(first.composers[1].name, "Bono");
+        assert_eq!(first.composers[2].name, "Larry Mullen Jr.");
+        assert_eq!(first.composers[3].name, "The Edge");
+        assert_eq!(first.aliases.len(), 1);
+        assert_eq!(first.aliases[0].name, "WOWY");
+        assert_eq!(result.matches[1].mbid, "work-live-gid");
+    }
+
+    #[test]
+    fn work_alias_exact_surfaces_parent() {
+        let conn = work_fixture_conn();
+        let result = query_work(&conn, "WOWY", None, &QueryOptions::default()).unwrap();
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].name, "With or Without You");
+    }
+
+    #[test]
+    fn work_substring_matches_name() {
+        let conn = work_fixture_conn();
+        let result = query_work(&conn, "Symphony", None, &QueryOptions::default()).unwrap();
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].name, "Symphony No. 1");
+    }
+
+    #[test]
+    fn work_composer_filter() {
+        let conn = work_fixture_conn();
+        let result = query_work(&conn, "With", Some("Bono"), &QueryOptions::default()).unwrap();
+        assert!(
+            result
+                .matches
+                .iter()
+                .all(|hit| hit.name == "With or Without You")
+        );
+        let none = query_work(&conn, "With", Some("Mozart"), &QueryOptions::default()).unwrap();
+        assert!(none.matches.is_empty());
+    }
+
+    #[test]
+    fn work_null_type_and_absent_edges_surface() {
+        let conn = work_fixture_conn();
+        let result = query_work(&conn, "Symphony No. 1", None, &QueryOptions::default()).unwrap();
+        assert_eq!(result.matches.len(), 1);
+        let hit = &result.matches[0];
+        assert!(hit.work_type.is_none());
+        assert!(hit.iswc.is_empty());
+        assert!(hit.composers.is_empty());
+    }
+
+    #[test]
+    fn work_no_match_returns_empty() {
+        let conn = work_fixture_conn();
+        let result = query_work(
+            &conn,
+            "A Work That Does Not Exist",
+            None,
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(result.matches.is_empty());
+    }
+
+    #[test]
+    fn work_empty_name_is_an_error() {
+        let conn = work_fixture_conn();
+        assert!(matches!(
+            query_work(&conn, "", None, &QueryOptions::default()),
+            Err(QueryError::EmptyQuery)
+        ));
+        assert!(matches!(
+            query_work(&conn, "   ", None, &QueryOptions::default()),
+            Err(QueryError::EmptyQuery)
+        ));
+    }
+
+    #[test]
+    fn work_limit_applies_after_ranking() {
+        let conn = work_fixture_conn();
+        let result = query_work(
+            &conn,
+            "With or Without You",
+            None,
+            &QueryOptions { limit: Some(1) },
+        )
+        .unwrap();
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(
+            result.matches[0].mbid,
+            "c90fe41d-9409-377b-aa32-3d0730d0e865"
+        );
+    }
+
+    #[test]
+    fn work_golden_json_contract() {
+        let conn = work_fixture_conn();
+        let result =
+            query_work(&conn, "With or Without You", None, &QueryOptions::default()).unwrap();
+        let actual = serde_json::to_string(&result).unwrap();
+        let expected =
+            fs::read_to_string(golden_path("query_work_with_or_without_you.json")).unwrap();
         assert_eq!(format!("{actual}\n"), expected);
     }
 }
