@@ -776,6 +776,470 @@ fn fetch_release_group_aliases(
     Ok(out)
 }
 
+/// One label on a release (plan §4: label evidence). A label-less
+/// `release_label` row (label FK NULL) still surfaces with its catalog
+/// number — nothing is silently dropped.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LabelHit {
+    pub name: Option<String>,
+    pub catalog_number: Option<String>,
+}
+
+/// One track in a medium tracklist (plan §4 `--inc tracks`).
+#[derive(Debug, Clone, Serialize)]
+pub struct TrackHit {
+    pub position: i32,
+    /// The printed track number as shipped ("1", "2a", …).
+    pub number: String,
+    pub name: String,
+    /// Track length in seconds (`track.length` ms → s); `None` when the
+    /// track has no recorded length.
+    pub duration_seconds: Option<f64>,
+    /// The recording `gid`, when the track's recording is resolvable.
+    pub recording_mbid: Option<String>,
+    pub is_data_track: bool,
+}
+
+/// One medium's tracklist (plan §4 `--inc tracks`).
+#[derive(Debug, Clone, Serialize)]
+pub struct MediumTracklist {
+    pub position: i32,
+    /// Medium display name (often empty).
+    pub name: String,
+    /// The track count the dump ships (`medium.track_count`).
+    pub track_count: i32,
+    pub tracks: Vec<TrackHit>,
+}
+
+/// A matched release (contract shape, plan §4).
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseHit {
+    pub kind: &'static str,
+    pub name: String,
+    /// The release `gid`, exposed as `mbid`.
+    pub mbid: String,
+    /// `release_status.name`; `None` when the status is unknown.
+    pub status: Option<String>,
+    /// Earliest date across `release_country`/`release_unknown_country`
+    /// for this release, formatted `YYYY-MM-DD` (partial dates render
+    /// month/day as 01, matching the release-group convention).
+    pub date: Option<String>,
+    /// Country names, one per `release_country` row, by area name.
+    pub countries: Vec<String>,
+    /// Labels + catalog numbers, ordered by release_label id.
+    pub labels: Vec<LabelHit>,
+    /// The artist credit for this release.
+    pub artist_credit: Vec<ArtistCreditEntry>,
+    /// Per-medium tracklists; `Some` only with `--inc tracks`.
+    pub tracklists: Option<Vec<MediumTracklist>>,
+}
+
+/// Query the releases of a release group by its `gid` (plan
+/// §4.`query release --release-group <mbid|gid> [--inc tracks]`).
+///
+/// The gid is an exact identifier, so there is no name ranking: every
+/// release of the group is returned in release-id order and no release
+/// is filtered out (statuses, dateless releases, and disambiguated
+/// duplicates stay visible).
+pub fn query_release(
+    conn: &Connection,
+    release_group_gid: &str,
+    inc_tracks: bool,
+    options: &QueryOptions,
+) -> Result<QueryResult<ReleaseHit>, QueryError> {
+    let gid = release_group_gid.trim();
+    if gid.is_empty() {
+        return Err(QueryError::EmptyQuery);
+    }
+
+    // Resolve the group by its gid. Unknown gids return an empty match
+    // set (there is nothing to evidence).
+    let mut stmt = conn.prepare("SELECT id FROM release_group WHERE gid = ?")?;
+    let rows = stmt.query_map(params![gid], |row| row.get::<_, i64>(0))?;
+    let mut group_ids: Vec<i64> = Vec::new();
+    for row in rows {
+        group_ids.push(row?);
+    }
+    if group_ids.is_empty() {
+        return Ok(QueryResult {
+            kind: "release",
+            query: gid.to_owned(),
+            matches: Vec::new(),
+        });
+    }
+    let group_id = group_ids[0];
+
+    // Every release of the group, deterministic by release id, with the
+    // status name joined in (status is 1:1 and nullable).
+    let mut stmt = conn.prepare(
+        "SELECT r.id, r.gid, r.name, rs.name AS status \
+         FROM release r \
+         LEFT JOIN release_status rs ON r.status = rs.id \
+         WHERE r.release_group = ? \
+         ORDER BY r.id",
+    )?;
+    let row_iter = stmt.query_map(params![group_id], |row| {
+        let id: i64 = row.get(0)?;
+        let gid: String = row.get(1)?;
+        let name: String = row.get(2)?;
+        let status: Option<String> = row.get::<_, Option<String>>(3)?;
+        Ok((id, gid, name, status))
+    })?;
+    let mut rows: Vec<(i64, String, String, Option<String>)> = Vec::new();
+    for row in row_iter {
+        rows.push(row?);
+    }
+    if let Some(limit) = options.limit {
+        rows.truncate(limit);
+    }
+
+    let ids: Vec<i64> = rows.iter().map(|(id, _, _, _)| *id).collect();
+    let dates = fetch_release_dates(conn, &ids)?;
+    let countries = fetch_release_countries(conn, &ids)?;
+    let labels = fetch_release_labels(conn, &ids)?;
+    let credit = fetch_release_artist_credits(conn, &ids)?;
+    let tracklists = if inc_tracks {
+        fetch_release_tracklists(conn, &ids)?
+    } else {
+        Default::default()
+    };
+
+    let matches = rows
+        .into_iter()
+        .map(|(id, gid, name, status)| {
+            let date: Option<String> = match dates.get(&id) {
+                Some(v) => v.clone(),
+                None => None,
+            };
+            let countries_vec: Vec<String> = match countries.get(&id) {
+                Some(v) => v.clone(),
+                None => Vec::new(),
+            };
+            let labels_vec: Vec<LabelHit> = match labels.get(&id) {
+                Some(v) => v.clone(),
+                None => Vec::new(),
+            };
+            let credit_vec: Vec<ArtistCreditEntry> = match credit.get(&id) {
+                Some(v) => v.clone(),
+                None => Vec::new(),
+            };
+            let tracklist_vec: Option<Vec<MediumTracklist>> = tracklists.get(&id).cloned();
+            ReleaseHit {
+                kind: "release",
+                name: name.clone(),
+                mbid: gid.clone(),
+                status,
+                date,
+                countries: countries_vec,
+                labels: labels_vec,
+                artist_credit: credit_vec,
+                tracklists: tracklist_vec,
+            }
+        })
+        .collect();
+
+    Ok(QueryResult {
+        kind: "release",
+        query: gid.to_owned(),
+        matches,
+    })
+}
+
+/// Map from release id to its earliest date (`YYYY-MM-DD`), computed
+/// across `release_country` and `release_unknown_country` like the
+/// release-group first date.
+fn fetch_release_dates(
+    conn: &Connection,
+    release_ids: &[i64],
+) -> Result<std::collections::BTreeMap<i64, Option<String>>, QueryError> {
+    let mut out: std::collections::BTreeMap<i64, Option<String>> = Default::default();
+    if release_ids.is_empty() {
+        return Ok(out);
+    }
+    let sql = format!(
+        "SELECT release_id, MIN(date_str) AS first_date \
+         FROM ( \
+           SELECT rc.release AS release_id, \
+               printf('%04d-%02d-%02d', rc.date_year, \
+                   COALESCE(rc.date_month, 1), COALESCE(rc.date_day, 1)) AS date_str \
+           FROM release_country rc \
+           WHERE rc.release IN ({}) AND rc.date_year IS NOT NULL \
+           UNION ALL \
+           SELECT ruc.release AS release_id, \
+               printf('%04d-%02d-%02d', ruc.date_year, \
+                   COALESCE(ruc.date_month, 1), COALESCE(ruc.date_day, 1)) AS date_str \
+           FROM release_unknown_country ruc \
+           WHERE ruc.release IN ({}) AND ruc.date_year IS NOT NULL \
+         ) sub \
+         GROUP BY release_id",
+        in_placeholders(release_ids.len()),
+        in_placeholders(release_ids.len()),
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut all_params: Vec<duckdb::types::Value> = Vec::new();
+    for _ in 0..2 {
+        for id in release_ids {
+            all_params.push(duckdb::types::Value::BigInt(*id));
+        }
+    }
+    let rows = stmt.query_map(params_from_iter(all_params.iter()), |row| {
+        let release_id: i64 = row.get(0)?;
+        let date_str: Option<String> = row.get(1)?;
+        Ok((release_id, date_str))
+    })?;
+    for row in rows {
+        let (release_id, date_str) = row?;
+        if let Some(d) = date_str {
+            out.insert(release_id, Some(d));
+        }
+    }
+    // Ensure every input id has a map entry (even when None).
+    for id in release_ids {
+        if !out.contains_key(id) {
+            out.insert(*id, None);
+        }
+    }
+    Ok(out)
+}
+
+/// Map from release id to its country names (area names), ordered by
+/// area name (deterministic for multi-country releases).
+fn fetch_release_countries(
+    conn: &Connection,
+    release_ids: &[i64],
+) -> Result<std::collections::BTreeMap<i64, Vec<String>>, QueryError> {
+    let mut out: std::collections::BTreeMap<i64, Vec<String>> = Default::default();
+    if release_ids.is_empty() {
+        return Ok(out);
+    }
+    let sql = format!(
+        "SELECT rc.release, a.name \
+         FROM release_country rc \
+         JOIN area a ON rc.country = a.id \
+         WHERE rc.release IN ({}) \
+         ORDER BY rc.release, a.name",
+        in_placeholders(release_ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params_from_iter(
+            release_ids
+                .iter()
+                .map(|id| duckdb::types::Value::BigInt(*id)),
+        ),
+        |row| {
+            let release_id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            Ok((release_id, name))
+        },
+    )?;
+    for row in rows {
+        let (release_id, name) = row?;
+        out.entry(release_id).or_default().push(name);
+    }
+    Ok(out)
+}
+
+/// Map from release id to its labels + catalog numbers, ordered by
+/// release_label id. Label-less rows keep their catalog number.
+fn fetch_release_labels(
+    conn: &Connection,
+    release_ids: &[i64],
+) -> Result<std::collections::BTreeMap<i64, Vec<LabelHit>>, QueryError> {
+    let mut out: std::collections::BTreeMap<i64, Vec<LabelHit>> = Default::default();
+    if release_ids.is_empty() {
+        return Ok(out);
+    }
+    let sql = format!(
+        "SELECT rl.release, l.name, rl.catalog_number \
+         FROM release_label rl \
+         LEFT JOIN label l ON rl.label = l.id \
+         WHERE rl.release IN ({}) \
+           AND (l.name IS NOT NULL OR rl.catalog_number IS NOT NULL) \
+         ORDER BY rl.id",
+        in_placeholders(release_ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params_from_iter(
+            release_ids
+                .iter()
+                .map(|id| duckdb::types::Value::BigInt(*id)),
+        ),
+        |row| {
+            let release_id: i64 = row.get(0)?;
+            let name: Option<String> = row.get::<_, Option<String>>(1)?;
+            let catalog_number: Option<String> = row.get::<_, Option<String>>(2)?;
+            Ok((
+                release_id,
+                LabelHit {
+                    name,
+                    catalog_number,
+                },
+            ))
+        },
+    )?;
+    for row in rows {
+        let (release_id, label) = row?;
+        out.entry(release_id).or_default().push(label);
+    }
+    Ok(out)
+}
+
+/// Map from release id to its artist credit (ordered by position).
+fn fetch_release_artist_credits(
+    conn: &Connection,
+    release_ids: &[i64],
+) -> Result<std::collections::BTreeMap<i64, Vec<ArtistCreditEntry>>, QueryError> {
+    let mut out: std::collections::BTreeMap<i64, Vec<ArtistCreditEntry>> = Default::default();
+    if release_ids.is_empty() {
+        return Ok(out);
+    }
+    let sql = format!(
+        "SELECT r.id AS release_id, a.name AS artist_name, a.gid, a.comment \
+         FROM release r \
+         JOIN artist_credit_name acn ON r.artist_credit = acn.artist_credit \
+         JOIN artist a ON acn.artist = a.id \
+         WHERE r.id IN ({}) \
+         ORDER BY r.id, acn.position",
+        in_placeholders(release_ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params_from_iter(
+            release_ids
+                .iter()
+                .map(|id| duckdb::types::Value::BigInt(*id)),
+        ),
+        |row| {
+            let release_id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            let gid: String = row.get(2)?;
+            let comment: Option<String> = row.get::<_, Option<String>>(3)?;
+            Ok((
+                release_id,
+                ArtistCreditEntry {
+                    name,
+                    mbid: gid,
+                    disambiguation: comment.unwrap_or_default(),
+                },
+            ))
+        },
+    )?;
+    for row in rows {
+        let (release_id, entry) = row?;
+        out.entry(release_id).or_default().push(entry);
+    }
+    Ok(out)
+}
+
+/// Map from release id to its per-medium tracklists.
+fn fetch_release_tracklists(
+    conn: &Connection,
+    release_ids: &[i64],
+) -> Result<std::collections::BTreeMap<i64, Vec<MediumTracklist>>, QueryError> {
+    struct MediaRow {
+        id: i64,
+        release: i64,
+        position: i32,
+        name: String,
+        track_count: i32,
+    }
+    let mut out: std::collections::BTreeMap<i64, Vec<MediumTracklist>> = Default::default();
+    if release_ids.is_empty() {
+        return Ok(out);
+    }
+
+    let mut media: Vec<MediaRow> = Vec::new();
+    {
+        let sql = format!(
+            "SELECT id, release, position, name, track_count \
+             FROM medium WHERE release IN ({}) \
+             ORDER BY release, position",
+            in_placeholders(release_ids.len())
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params_from_iter(
+                release_ids
+                    .iter()
+                    .map(|id| duckdb::types::Value::BigInt(*id)),
+            ),
+            |row| {
+                Ok(MediaRow {
+                    id: row.get(0)?,
+                    release: row.get(1)?,
+                    position: row.get(2)?,
+                    name: row.get(3)?,
+                    track_count: row.get(4)?,
+                })
+            },
+        )?;
+        for row in rows {
+            media.push(row?);
+        }
+    }
+
+    let mut tracks_by_medium: std::collections::BTreeMap<i64, Vec<TrackHit>> = Default::default();
+    if !media.is_empty() {
+        let medium_ids: Vec<i64> = media.iter().map(|m| m.id).collect();
+        let sql = format!(
+            "SELECT t.medium, t.position, t.number, t.name, t.length, \
+                    t.is_data_track, rec.gid \
+             FROM track t \
+             LEFT JOIN recording rec ON t.recording = rec.id \
+             WHERE t.medium IN ({}) \
+             ORDER BY t.medium, t.position",
+            in_placeholders(medium_ids.len())
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params_from_iter(
+                medium_ids
+                    .iter()
+                    .map(|id| duckdb::types::Value::BigInt(*id)),
+            ),
+            |row| {
+                let medium_id: i64 = row.get(0)?;
+                let position: i32 = row.get(1)?;
+                let number: String = row.get(2)?;
+                let name: String = row.get(3)?;
+                let length: Option<i64> = row.get::<_, Option<i64>>(4)?;
+                let is_data_track: bool = row.get(5)?;
+                let rec_gid: Option<String> = row.get::<_, Option<String>>(6)?;
+                Ok((
+                    medium_id,
+                    TrackHit {
+                        position,
+                        number,
+                        name,
+                        duration_seconds: length.map(|ms| (ms as f64) / 1000.0),
+                        recording_mbid: rec_gid,
+                        is_data_track,
+                    },
+                ))
+            },
+        )?;
+        for row in rows {
+            let (medium_id, track) = row?;
+            tracks_by_medium.entry(medium_id).or_default().push(track);
+        }
+    }
+
+    for media_row in media {
+        let tracks: Vec<TrackHit> = tracks_by_medium.remove(&media_row.id).unwrap_or_default();
+        out.entry(media_row.release)
+            .or_default()
+            .push(MediumTracklist {
+                position: media_row.position,
+                name: media_row.name,
+                track_count: media_row.track_count,
+                tracks,
+            });
+    }
+    Ok(out)
+}
+
 /// Build `?,?,?,…` for an `IN` clause.
 fn in_placeholders(count: usize) -> String {
     vec!["?"; count].join(", ")
@@ -1252,6 +1716,371 @@ mod tests {
         let actual = serde_json::to_string(&result).unwrap();
         let expected =
             fs::read_to_string(golden_path("query_release_group_joshua_tree.json")).unwrap();
+        assert_eq!(format!("{actual}\n"), expected);
+    }
+
+    // ------------------------------------------------------------------ //
+    //  Release query tests                                              //
+    // ------------------------------------------------------------------ //
+
+    /// In-memory DuckDB mirroring the loader's target surface for the
+    /// release query. Column sets mirror the pinned schema-31 shapes (no
+    /// invented columns), and the canonical Joshua Tree tracklist is the
+    /// verified 1987-03-09 UK release (release 294454) data: names,
+    /// track lengths, and recording gids are the shipped values.
+    fn release_fixture_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE artist (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL,
+                 sort_name VARCHAR NOT NULL,
+                 comment VARCHAR NOT NULL DEFAULT ''
+             );
+             CREATE TABLE artist_credit (
+                 id INTEGER PRIMARY KEY,
+                 name VARCHAR NOT NULL,
+                 artist_count SMALLINT NOT NULL,
+                 gid VARCHAR NOT NULL
+             );
+             CREATE TABLE artist_credit_name (
+                 artist_credit INTEGER NOT NULL,
+                 position SMALLINT NOT NULL,
+                 artist INTEGER NOT NULL,
+                 name VARCHAR NOT NULL,
+                 join_phrase VARCHAR NOT NULL DEFAULT ''
+             );
+             CREATE TABLE area (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL
+             );
+             CREATE TABLE release_status (
+                 id INTEGER PRIMARY KEY,
+                 name VARCHAR NOT NULL,
+                 gid VARCHAR NOT NULL
+             );
+             CREATE TABLE release_group (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL,
+                 artist_credit INTEGER NOT NULL,
+                 type INTEGER
+             );
+             CREATE TABLE release (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL,
+                 artist_credit INTEGER NOT NULL,
+                 release_group INTEGER NOT NULL,
+                 status INTEGER
+             );
+             CREATE TABLE release_country (
+                 release INTEGER NOT NULL,
+                 country INTEGER NOT NULL,
+                 date_year SMALLINT,
+                 date_month SMALLINT,
+                 date_day SMALLINT
+             );
+             CREATE TABLE release_unknown_country (
+                 release INTEGER NOT NULL,
+                 date_year SMALLINT,
+                 date_month SMALLINT,
+                 date_day SMALLINT
+             );
+             CREATE TABLE label (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL
+             );
+             CREATE TABLE release_label (
+                 id INTEGER PRIMARY KEY,
+                 release INTEGER NOT NULL,
+                 label INTEGER,
+                 catalog_number VARCHAR
+             );
+             CREATE TABLE recording (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL,
+                 artist_credit INTEGER NOT NULL,
+                 length INTEGER
+             );
+             CREATE TABLE medium (
+                 id INTEGER PRIMARY KEY,
+                 release INTEGER NOT NULL,
+                 position INTEGER NOT NULL,
+                 name VARCHAR NOT NULL DEFAULT '',
+                 track_count INTEGER NOT NULL DEFAULT 0,
+                 gid VARCHAR NOT NULL
+             );
+             CREATE TABLE track (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 recording INTEGER NOT NULL,
+                 medium INTEGER NOT NULL,
+                 position INTEGER NOT NULL,
+                 number VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL,
+                 artist_credit INTEGER NOT NULL,
+                 length INTEGER,
+                 is_data_track BOOLEAN NOT NULL DEFAULT FALSE
+             );
+             INSERT INTO artist (id, gid, name, sort_name, comment) VALUES
+                (1, 'a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432', 'U2', 'U2', 'Irish rock band');
+             INSERT INTO artist_credit (id, name, artist_count, gid) VALUES
+                (1, 'U2', 1, 'ac-u2-gid');
+             INSERT INTO artist_credit_name (artist_credit, position, artist, name, join_phrase) VALUES
+                (1, 1, 1, 'U2', '');
+             INSERT INTO area (id, gid, name) VALUES
+                (1, 'area-us-gid', 'United States'),
+                (2, 'area-gb-gid', 'United Kingdom'),
+                (3, 'area-fr-gid', 'France'),
+                (4, 'area-de-gid', 'Germany');
+             INSERT INTO release_status (id, name, gid) VALUES
+                (1, 'Official', 'rs-official-gid');
+             INSERT INTO release_group (id, gid, name, artist_credit) VALUES
+                (1, '6f3e9fa6-acd3-4ce0-8f36-1e5aa6a18432', 'The Joshua Tree', 1);
+             INSERT INTO release (id, gid, name, artist_credit, release_group, status) VALUES
+                (1, 'rel-us-1987-gid', 'The Joshua Tree', 1, 1, 1),
+                (2, 'rel-uk-1987-gid', 'The Joshua Tree', 1, 1, 1),
+                (3, 'rel-2017-gid', 'The Joshua Tree (30th Anniversary)', 1, 1, NULL),
+                (4, 'rel-fr-de-gid', 'The Joshua Tree', 1, 1, 1);
+             INSERT INTO release_country (release, country, date_year, date_month, date_day) VALUES
+                (1, 1, 1987, NULL, NULL),
+                (2, 2, 1987, 3, 9),
+                (4, 3, 1987, 6, 15),
+                (4, 4, 1987, 6, 15);
+             INSERT INTO release_unknown_country (release, date_year, date_month, date_day) VALUES
+                (3, 2017, 6, 2);
+             INSERT INTO label (id, gid, name) VALUES
+                (1, 'label-island-gid', 'Island');
+             INSERT INTO release_label (id, release, label, catalog_number) VALUES
+                (1, 1, 1, 'CID U2 6'),
+                (2, 1, 1, '842 298-2'),
+                (3, 3, NULL, 'B0012345');
+             INSERT INTO recording (id, gid, name, artist_credit, length) VALUES
+                (172334, '176ce892-5deb-457b-b3a2-d947c45ac712', 'Where the Streets Have No Name', 1, 337520),
+                (172335, '94793531-2679-4ea7-a273-945fdf64c06f', 'I Still Haven’t Found What I’m Looking For', 1, 278133),
+                (172336, '6b9a509f-6907-4a6e-9345-2f12da09ba4b', 'With or Without You', 1, 296160),
+                (172337, 'de73f389-69c3-4d3f-ab0b-30b1e4748e03', 'Bullet the Blue Sky', 1, 272133),
+                (172338, '88ad5e5e-521e-499f-9201-4114d7feb6c4', 'Running to Stand Still', 1, 257600),
+                (172339, '3f7ee760-5ba7-462d-b523-f0e0026df4a6', 'Red Hill Mining Town', 1, 293933),
+                (172340, '4e148771-1a7b-4d36-90d4-5c1c8dac4f17', 'In God’s Country', 1, 177040),
+                (172341, '69e71dd2-1c51-48d0-a7cc-8f952c49121a', 'Trip Through Your Wires', 1, 212333),
+                (172342, '2c81e785-299f-4e87-9ff1-882cffcf748e', 'One Tree Hill', 1, 323000),
+                (172343, '8d8d1f8e-bdff-4d01-8c9e-9daeedc22982', 'Exit', 1, 253333),
+                (172344, '09c7be61-aad9-4992-8a1b-3b192b6682d2', 'Mothers of the Disappeared', 1, 311893),
+                (300004, 'rec-after-the-flood-gid', 'After the Flood', 1, NULL),
+                (300005, 'rec-intro-gid', 'Intro', 1, 60000),
+                (300006, 'rec-outro-gid', 'Outro', 1, NULL);
+             INSERT INTO medium (id, release, position, name, track_count, gid) VALUES
+                (1, 2, 1, '', 11, 'medium-2-1-gid'),
+                (2, 3, 1, '', 4, 'medium-3-1-gid'),
+                (3, 3, 2, 'DVD', 2, 'medium-3-2-gid');
+             INSERT INTO track (id, gid, recording, medium, position, number, name, artist_credit, length, is_data_track) VALUES
+                (1, 'track-2-01', 172334, 1, 1, '1', 'Where the Streets Have No Name', 1, 337973, FALSE),
+                (2, 'track-2-02', 172335, 1, 2, '2', 'I Still Haven’t Found What I’m Looking For', 1, 278133, FALSE),
+                (3, 'track-2-03', 172336, 1, 3, '3', 'With or Without You', 1, 296160, FALSE),
+                (4, 'track-2-04', 172337, 1, 4, '4', 'Bullet the Blue Sky', 1, 272133, FALSE),
+                (5, 'track-2-05', 172338, 1, 5, '5', 'Running to Stand Still', 1, 257600, FALSE),
+                (6, 'track-2-06', 172339, 1, 6, '6', 'Red Hill Mining Town', 1, 293933, FALSE),
+                (7, 'track-2-07', 172340, 1, 7, '7', 'In God’s Country', 1, 177040, FALSE),
+                (8, 'track-2-08', 172341, 1, 8, '8', 'Trip Through Your Wires', 1, 212333, FALSE),
+                (9, 'track-2-09', 172342, 1, 9, '9', 'One Tree Hill', 1, 323000, FALSE),
+                (10, 'track-2-10', 172343, 1, 10, '10', 'Exit', 1, 253333, FALSE),
+                (11, 'track-2-11', 172344, 1, 11, '11', 'Mothers of the Disappeared', 1, 311893, FALSE),
+                (101, 'track-3-101', 172334, 2, 1, '1', 'Where the Streets Have No Name', 1, 337973, FALSE),
+                (102, 'track-3-102', 172336, 2, 2, '2', 'With or Without You', 1, 296160, FALSE),
+                (103, 'track-3-103', 172339, 2, 3, '3', 'Red Hill Mining Town', 1, 293933, FALSE),
+                (104, 'track-3-104', 300004, 2, 4, '4', 'After the Flood', 1, NULL, TRUE),
+                (105, 'track-3-105', 300005, 3, 1, '1', 'Intro', 1, 60000, FALSE),
+                (106, 'track-3-106', 300006, 3, 2, '2', 'Outro', 1, NULL, FALSE);",
+        )
+        .expect("seed release fixture");
+        conn
+    }
+
+    #[test]
+    fn release_lists_groups_releases_in_id_order() {
+        let conn = release_fixture_conn();
+        let result = query_release(
+            &conn,
+            "6f3e9fa6-acd3-4ce0-8f36-1e5aa6a18432",
+            false,
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.matches.len(), 4);
+        // Nothing is silently filtered: statuses, dateless releases, and
+        // disambiguated variants all stay visible, in release-id order.
+        let hit1 = &result.matches[0];
+        assert_eq!(hit1.name, "The Joshua Tree");
+        assert_eq!(hit1.mbid, "rel-us-1987-gid");
+        assert_eq!(hit1.status.as_deref(), Some("Official"));
+        assert_eq!(hit1.date.as_deref(), Some("1987-01-01"));
+        assert_eq!(hit1.countries, vec!["United States"]);
+        assert_eq!(hit1.labels.len(), 2);
+        assert_eq!(hit1.labels[0].name.as_deref(), Some("Island"));
+        assert_eq!(hit1.labels[0].catalog_number.as_deref(), Some("CID U2 6"));
+        assert_eq!(hit1.labels[1].catalog_number.as_deref(), Some("842 298-2"));
+        let hit2 = &result.matches[1];
+        assert_eq!(hit2.date.as_deref(), Some("1987-03-09"));
+        assert_eq!(hit2.countries, vec!["United Kingdom"]);
+        assert!(hit2.labels.is_empty());
+        let hit3 = &result.matches[2];
+        assert!(hit3.status.is_none(), "status-less releases stay visible");
+        assert_eq!(hit3.date.as_deref(), Some("2017-06-02"));
+        assert!(hit3.countries.is_empty());
+        assert_eq!(hit3.labels.len(), 1);
+        assert!(
+            hit3.labels[0].name.is_none(),
+            "label-less row keeps its catalog"
+        );
+        assert_eq!(hit3.labels[0].catalog_number.as_deref(), Some("B0012345"));
+        let hit4 = &result.matches[3];
+        assert_eq!(hit4.countries, vec!["France", "Germany"]);
+        assert_eq!(hit4.date.as_deref(), Some("1987-06-15"));
+    }
+
+    #[test]
+    fn release_tracklists_span_media_with_durations() {
+        let conn = release_fixture_conn();
+        let result = query_release(
+            &conn,
+            "6f3e9fa6-acd3-4ce0-8f36-1e5aa6a18432",
+            true,
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let hit2 = &result.matches[1];
+        let tracklists = hit2
+            .tracklists
+            .as_ref()
+            .expect("tracklists present with --inc tracks");
+        assert_eq!(tracklists.len(), 1);
+        let medium = &tracklists[0];
+        assert_eq!(medium.position, 1);
+        assert_eq!(medium.track_count, 11);
+        assert_eq!(medium.tracks.len(), 11);
+        let first = &medium.tracks[0];
+        assert_eq!(first.position, 1);
+        assert_eq!(first.number, "1");
+        assert_eq!(first.name, "Where the Streets Have No Name");
+        assert_eq!(first.duration_seconds, Some(337.973));
+        assert_eq!(
+            first.recording_mbid.as_deref(),
+            Some("176ce892-5deb-457b-b3a2-d947c45ac712")
+        );
+        assert!(!first.is_data_track);
+        let eleventh = &medium.tracks[10];
+        assert_eq!(eleventh.name, "Mothers of the Disappeared");
+        assert_eq!(eleventh.number, "11");
+        assert_eq!(eleventh.duration_seconds.expect("length"), 311.893);
+        // Durations are lengths in seconds (ms → s), per plan §4.
+        assert_eq!(medium.tracks[4].duration_seconds.expect("length"), 257.6);
+    }
+
+    #[test]
+    fn release_inc_tracks_off_leaves_tracklists_absent() {
+        let conn = release_fixture_conn();
+        let result = query_release(
+            &conn,
+            "6f3e9fa6-acd3-4ce0-8f36-1e5aa6a18432",
+            false,
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        for hit in result.matches {
+            assert!(hit.tracklists.is_none());
+        }
+    }
+
+    #[test]
+    fn release_data_track_and_null_length_surface() {
+        let conn = release_fixture_conn();
+        let result = query_release(
+            &conn,
+            "6f3e9fa6-acd3-4ce0-8f36-1e5aa6a18432",
+            true,
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let hit3 = &result.matches[2];
+        let tracklists = hit3
+            .tracklists
+            .as_ref()
+            .expect("tracklists present with --inc tracks");
+        assert_eq!(tracklists.len(), 2);
+        assert_eq!(tracklists[0].name, "");
+        assert_eq!(tracklists[1].name, "DVD");
+        let disc1 = &tracklists[0].tracks;
+        assert_eq!(disc1.len(), 4);
+        let after_flood = &disc1[3];
+        assert_eq!(after_flood.name, "After the Flood");
+        assert!(after_flood.is_data_track, "data tracks are surfaced");
+        assert!(after_flood.duration_seconds.is_none());
+        let disc2 = &tracklists[1].tracks;
+        assert_eq!(disc2.len(), 2);
+        assert_eq!(disc2[0].duration_seconds.expect("length"), 60.0);
+        assert!(disc2[1].duration_seconds.is_none());
+    }
+
+    #[test]
+    fn release_unknown_gid_returns_empty() {
+        let conn = release_fixture_conn();
+        let result = query_release(
+            &conn,
+            "00000000-0000-4000-8000-000000000000",
+            false,
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(result.matches.is_empty());
+        assert_eq!(result.query, "00000000-0000-4000-8000-000000000000");
+    }
+
+    #[test]
+    fn release_empty_gid_is_an_error() {
+        let conn = release_fixture_conn();
+        assert!(matches!(
+            query_release(&conn, "", false, &QueryOptions::default()),
+            Err(QueryError::EmptyQuery)
+        ));
+        assert!(matches!(
+            query_release(&conn, "   ", false, &QueryOptions::default()),
+            Err(QueryError::EmptyQuery)
+        ));
+    }
+
+    #[test]
+    fn release_limit_applies_after_ordering() {
+        let conn = release_fixture_conn();
+        let result = query_release(
+            &conn,
+            "6f3e9fa6-acd3-4ce0-8f36-1e5aa6a18432",
+            false,
+            &QueryOptions { limit: Some(2) },
+        )
+        .unwrap();
+        assert_eq!(result.matches.len(), 2);
+        assert_eq!(result.matches[0].mbid, "rel-us-1987-gid");
+        assert_eq!(result.matches[1].mbid, "rel-uk-1987-gid");
+    }
+
+    #[test]
+    fn release_golden_json_contract() {
+        let conn = release_fixture_conn();
+        let result = query_release(
+            &conn,
+            "6f3e9fa6-acd3-4ce0-8f36-1e5aa6a18432",
+            true,
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let actual = serde_json::to_string(&result).unwrap();
+        let expected = fs::read_to_string(golden_path("query_release_joshua_tree.json")).unwrap();
         assert_eq!(format!("{actual}\n"), expected);
     }
 }

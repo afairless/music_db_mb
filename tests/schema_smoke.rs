@@ -8,7 +8,7 @@
 use duckdb::Connection;
 
 use mbdb::manifest::{ALL, table};
-use mbdb::query::{QueryOptions, query_artist, query_release_group};
+use mbdb::query::{QueryOptions, query_artist, query_release, query_release_group};
 use mbdb::schema::{create_schema, ddl};
 
 /// Query helper: count rows in `information_schema.tables` matching a name.
@@ -175,7 +175,19 @@ fn seed_query_tables(conn: &mut Connection) {
          INSERT INTO release (id, gid, name, artist_credit, release_group, status) VALUES
             (1, 'rel-joshua-tree-gid', 'The Joshua Tree', 1, 1, 1);
          INSERT INTO release_country (release, country, date_year, date_month, date_day) VALUES
-            (1, 1, 1987, 3, 9);"
+            (1, 1, 1987, 3, 9);
+         INSERT INTO label (id, gid, name) VALUES
+            (1, 'label-island-gid', 'Island');
+         INSERT INTO release_label (id, release, label, catalog_number) VALUES
+            (1, 1, 1, 'CID U2 6');
+         INSERT INTO recording (id, gid, name, artist_credit, length) VALUES
+            (1, 'rec-gid-1', 'Where the Streets Have No Name', 1, 337520);
+         INSERT INTO medium (id, release, position, name, track_count, gid) VALUES
+            (1, 1, 1, '', 1, 'med-gid-1');
+         INSERT INTO track (id, gid, recording, medium, position, number, name,
+                            artist_credit, length, is_data_track) VALUES
+            (1, 'track-gid-1', 1, 1, 1, '1', 'Where the Streets Have No Name',
+             1, 337973, FALSE);"
     )
     .unwrap();
 }
@@ -210,4 +222,39 @@ fn smoke_queries_bind_to_real_schema() {
         rg.matches[0].first_release_date.as_deref(),
         Some("1987-03-09")
     );
+}
+
+#[test]
+fn smoke_release_query_binds_to_real_schema() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    create_schema(&mut conn).unwrap();
+    seed_query_tables(&mut conn);
+
+    // The release query binds to the real column set: status join,
+    // country dates, labels, and the per-medium tracklist joins
+    // (release_label.label can be NULL, track.length is nullable, and
+    // `release_unknown_country` carries no surrogate id).
+    let result = query_release(
+        &conn,
+        "6f3e9fa6-acd3-4ce0-8f36-1e5aa6a18432",
+        true,
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(result.matches.len(), 1);
+    let hit = &result.matches[0];
+    assert_eq!(hit.status.as_deref(), Some("Official"));
+    assert_eq!(hit.date.as_deref(), Some("1987-03-09"));
+    assert_eq!(hit.countries, vec!["United States"]);
+    assert_eq!(hit.labels.len(), 1);
+    assert_eq!(hit.labels[0].name.as_deref(), Some("Island"));
+    let tracklists = hit
+        .tracklists
+        .as_ref()
+        .expect("tracklists present with --inc tracks");
+    assert_eq!(tracklists.len(), 1);
+    let track = &tracklists[0].tracks[0];
+    assert_eq!(track.name, "Where the Streets Have No Name");
+    assert_eq!(track.duration_seconds.expect("length"), 337.973);
+    assert_eq!(track.recording_mbid.as_deref(), Some("rec-gid-1"));
 }

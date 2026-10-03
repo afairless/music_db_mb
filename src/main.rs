@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use mbdb::config::{CliOverrides, Config, DEFAULT_CONFIG_PATH, Settings};
 use mbdb::import::{LoadReport, load, rejections_path, verify_integrity};
-use mbdb::query::{QueryOptions, query_artist, query_release_group};
+use mbdb::query::{QueryOptions, query_artist, query_release, query_release_group};
 
 /// The mbdb command-line interface.
 #[derive(Debug, Parser)]
@@ -54,6 +54,25 @@ enum QueryKind {
     /// Query release groups by name with types, first-release-date, and
     /// artist credit.
     ReleaseGroup(ReleaseGroupArgs),
+    /// List the releases of a release group (by gid), optionally with
+    /// per-medium tracklists and durations.
+    Release(ReleaseArgs),
+}
+
+/// Arguments for `mbdb query release`.
+#[derive(Debug, Args)]
+struct ReleaseArgs {
+    /// Release-group gid/mbid whose releases to list.
+    #[arg(long, value_name = "MBID")]
+    release_group: String,
+
+    /// Include per-medium tracklists with durations in seconds.
+    #[arg(long)]
+    inc_tracks: bool,
+
+    /// Cap the number of matches printed (default: all).
+    #[arg(long, value_name = "N")]
+    limit: Option<usize>,
 }
 
 /// Arguments for `mbdb query release-group`.
@@ -165,10 +184,7 @@ fn run_query(args: &QueryArgs) {
                     std::process::exit(1);
                 }
             };
-            println!(
-                "{}",
-                serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_owned())
-            );
+            emit_json(&result);
         }
         QueryKind::ReleaseGroup(rg) => {
             let options = QueryOptions { limit: rg.limit };
@@ -186,12 +202,31 @@ fn run_query(args: &QueryArgs) {
                     std::process::exit(1);
                 }
             };
-            println!(
-                "{}",
-                serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_owned())
-            );
+            emit_json(&result);
+        }
+        QueryKind::Release(release) => {
+            let options = QueryOptions {
+                limit: release.limit,
+            };
+            let result = query_release(&conn, &release.release_group, release.inc_tracks, &options);
+            let result = match result {
+                Ok(r) => r,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(1);
+                }
+            };
+            emit_json(&result);
         }
     }
+}
+
+/// Print a query result as JSON on its own line (the CLI contract).
+fn emit_json<T: serde::Serialize>(value: &T) {
+    println!(
+        "{}",
+        serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned())
+    );
 }
 
 fn run_import(args: &ImportArgs) {
