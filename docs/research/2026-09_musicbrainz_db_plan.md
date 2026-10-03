@@ -335,7 +335,7 @@ results, refresh-cycle record) per the house documentation conventions.
 - **Wall clock: 6 h 04 m** (16:44→22:48 on 2026-10-01) — above the plan's 30–180 min estimate; the
   plan's budget assumed faster backpressure/IO; checkpoint/resume made the runtime a non-issue. Peak
   RSS ~7.4 GB, constant-memory design held (no spill files written). DB finished at 13.2 GB.
-- Loaded **49 tables, 248,267,192 rows**, zero rejections, checkpoint totals == table counts,
+- Loaded **50 tables, 248,267,192 rows**, zero rejections, checkpoint totals == table counts,
   `referential integrity: CLEAN`. Headline counts: track 58 166 762, recording 40 393 216,
   url 21 975 488, release_country 13 302 253, l_release_url 10 715 151, l_artist_recording
   18 974 102, release 5 814 410, medium 6 380 068, artist 2 999 670, artist_credit 3 891 400,
@@ -349,3 +349,44 @@ results, refresh-cycle record) per the house documentation conventions.
   resume semantics needed no `--resume` invocation — the run simply continued. Lesson: the
   download + DB peak (≈ 7.9 GB archives + 13.2 GB DB + baseline) exceeds the original 59 GB-free
   headroom estimate only marginally; keep ≥ 30 GB free before a refresh run.
+- **Independent re-verification over the finished artifacts (2026-10-03):** both archives re-checked
+  against the shipped `mbdump.MD5SUMS` → `mbdump.tar.bz2: OK`, `mbdump-derived.tar.bz2: OK` (the 8
+  other listed archives are optional extras never downloaded). `duckdb count(*)` per table cross-checked
+  against the checkpoint (the import's own per-member inventory record): **all 50 tables match,
+  248,267,192 rows** (the §R3 table-count typo above was corrected from 49). The full
+  `verify_integrity` edge set (78 manifest FK edges) re-run via `duckdb` → **zero orphans on every
+  edge** (`referential integrity: CLEAN` stands). No `musicbrainz.duckdb.rejections.log` exists
+  (the importer writes that file only when rejections occur) → zero rejections stands. Tar identity:
+  `TIMESTAMP` = `2026-09-30 00:22:23.614571+00`, `SCHEMA_SEQUENCE` = `31`; the derived archive
+  member list re-confirms **no `l_*_wikidata` / `recording_first_release_date`** members.
+
+  Inventory vs loaded counts per table (checkpoint == duckdb, 2026-10-03):
+
+  ```text
+    (50 tables, 248,267,192 rows)
+    | area                                  120,100 | link_attribute_type                     1,169 |
+    | area_gid_redirect                         191 | link_type                                 697 |
+    | artist                              2,999,670 | medium                              6,380,068 |
+    | artist_alias                          543,609 | recording                          40,393,216 |
+    | artist_credit                       3,891,400 | recording_alias                     1,070,599 |
+    | artist_credit_gid_redirect             78,989 | recording_gid_redirect              5,076,814 |
+    | artist_credit_name                  7,248,071 | release                             5,814,410 |
+    | artist_gid_redirect                    90,254 | release_country                    13,302,253 |
+    | isrc                                6,428,672 | release_gid_redirect                  191,158 |
+    | iswc                                  536,229 | release_group                       4,548,300 |
+    | l_artist_recording                 18,974,102 | release_group_alias                    72,504 |
+    | l_artist_release                    1,627,780 | release_group_gid_redirect            233,534 |
+    | l_artist_release_group                 17,140 | release_group_primary_type                  5 |
+    | l_artist_url                        6,486,062 | release_group_secondary_type               12 |
+    | l_artist_work                       4,722,105 | release_group_secondary_type_join     978,345 |
+    | l_label_release                       727,961 | release_label                       4,975,864 |
+    | l_recording_release                     1,345 | release_packaging                          24 |
+    | l_recording_url                     5,291,079 | release_status                              7 |
+    | l_recording_work                    7,921,893 | release_unknown_country               479,296 |
+    | l_release_group_url                 1,032,874 | track                              58,166,762 |
+    | l_release_url                      10,715,151 | url                                21,975,488 |
+    | l_url_work                            421,108 | url_gid_redirect                       38,708 |
+    | label                                 351,433 | work                                2,858,457 |
+    | label_gid_redirect                      9,110 | work_alias                            162,582 |
+    | link                                1,150,983 | work_gid_redirect                     159,609 |
+  ```
