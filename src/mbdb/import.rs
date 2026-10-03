@@ -1048,12 +1048,12 @@ mod tests {
                     bzip2::Compression::best(),
                 ));
                 append_members(&mut builder, members);
-                let _ = builder.finish().unwrap();
+                builder.finish().unwrap();
             }
             "xz" => {
                 let mut builder = tar::Builder::new(xz2::write::XzEncoder::new(file, 6));
                 append_members(&mut builder, members);
-                let _ = builder.finish().unwrap();
+                builder.finish().unwrap();
             }
             _ => panic!("write_archive: unknown compression"),
         }
@@ -1074,7 +1074,7 @@ mod tests {
     }
 
     /// A ready dump directory + resolved settings under `tmp`.
-    fn fixture(tmp: &PathBuf, archive_names: &[&str], tables: Tables) -> (Settings, PathBuf) {
+    fn fixture(tmp: &Path, archive_names: &[&str], tables: Tables) -> (Settings, PathBuf) {
         let dump = tmp.join("dumps");
         fs::create_dir_all(&dump).unwrap();
         for name in archive_names {
@@ -1177,7 +1177,7 @@ mod tests {
         );
 
         // Checkpoint file advanced exactly to the committed rows.
-        let text = fs::read_to_string(&checkpoint_path(&db)).unwrap();
+        let text = fs::read_to_string(checkpoint_path(&db)).unwrap();
         let checkpoint = toml::from_str::<Checkpoint>(&text).unwrap();
         assert_eq!(checkpoint.tables.get("artist"), Some(&3));
         assert_eq!(checkpoint.tables.get("release_group"), Some(&1));
@@ -1284,7 +1284,6 @@ mod tests {
         let report = load(&settings, false).unwrap();
         assert!(report.rejections.is_empty());
 
-        let conn = Connection::open(&db).unwrap();
         let mut conn = Connection::open(&db).unwrap();
         let integrity = verify_integrity(&mut conn).unwrap();
         let orphans = integrity
@@ -1351,7 +1350,7 @@ mod tests {
             "artist",
             &[("id", "4"), ("name", "bad-bool"), ("ended", "z")],
         );
-        let artist_member = vec![good, wrong_width, bad_int, bad_bool].join("");
+        let artist_member = [good, wrong_width, bad_int, bad_bool].join("");
         write_archive(
             &root.join("dumps").join("mbdump.tar.bz2"),
             "bz2",
@@ -1376,7 +1375,7 @@ mod tests {
         assert_eq!(sample0, "1\ttoo_few_fields\n");
 
         // The log exists and carries count + samples.
-        let log = fs::read_to_string(&rejections_path(&db)).unwrap();
+        let log = fs::read_to_string(rejections_path(&db)).unwrap();
         assert!(log.contains("[artist]"));
         assert!(log.contains("count = 3"));
         assert!(log.contains("bad-int"));
@@ -1411,7 +1410,6 @@ mod tests {
         // Simulate an interrupt after the first artist row committed: the
         // database holds exactly that row and the checkpoint says so.
         {
-            let conn = Connection::open(&db).unwrap();
             let mut conn = Connection::open(&db).unwrap();
             create_schema_with(
                 &mut conn,
@@ -1434,7 +1432,7 @@ mod tests {
         let mut checkpoint = Checkpoint::default();
         let _ = checkpoint.tables.insert("artist".to_owned(), 1);
         let checkpoint_text = toml::to_string(&checkpoint).unwrap();
-        let _ = fs::write(&checkpoint_path(&db), checkpoint_text);
+        let _ = fs::write(checkpoint_path(&db), checkpoint_text);
 
         let report = load(&settings, true).unwrap();
         assert_eq!(
@@ -1472,7 +1470,7 @@ mod tests {
         );
 
         // Checkpoint advanced to include the newly committed rows.
-        let text = fs::read_to_string(&checkpoint_path(&db)).unwrap();
+        let text = fs::read_to_string(checkpoint_path(&db)).unwrap();
         let checkpoint = toml::from_str::<Checkpoint>(&text).unwrap();
         assert_eq!(checkpoint.tables.get("artist"), Some(&3));
         assert_eq!(checkpoint.tables.get("release_group"), Some(&1));
@@ -1524,7 +1522,7 @@ mod tests {
             let conn = Connection::open(&db).unwrap();
             let _ = conn;
         }
-        let _ = fs::write(&checkpoint_path(&db), "not = [valid").unwrap();
+        fs::write(checkpoint_path(&db), "not = [valid").unwrap();
 
         let result = load(&settings, true);
         assert!(matches!(

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use mbdb::config::{CliOverrides, Config, DEFAULT_CONFIG_PATH, Settings};
 use mbdb::import::{LoadReport, load, rejections_path, verify_integrity};
+use mbdb::query::{QueryOptions, query_artist};
 
 /// The mbdb command-line interface.
 #[derive(Debug, Parser)]
@@ -25,6 +26,43 @@ struct Cli {
 enum Command {
     /// Import MusicBrainz dump tarballs into a DuckDB database.
     Import(ImportArgs),
+    /// Query the MusicBrainz DuckDB database.
+    Query(QueryArgs),
+}
+
+/// Arguments for `mbdb query`.
+#[derive(Debug, Args)]
+struct QueryArgs {
+    /// Override the config file path (default: ./config.toml).
+    #[arg(long, value_name = "PATH")]
+    config: Option<String>,
+
+    /// Override the database path (config: db).
+    #[arg(long, value_name = "PATH")]
+    db: Option<String>,
+
+    #[command(subcommand)]
+    kind: QueryKind,
+}
+
+/// Query kinds (one per evidence surface, plan §4).
+#[derive(Debug, Subcommand)]
+enum QueryKind {
+    /// Query artists by name (exact first, then sort_name/alias, then
+    /// substring) with aliases and disambiguation surfaced.
+    Artist(ArtistArgs),
+}
+
+/// Arguments for `mbdb query artist`.
+#[derive(Debug, Args)]
+struct ArtistArgs {
+    /// Artist name to search for (case-sensitive).
+    #[arg(long, value_name = "NAME")]
+    name: String,
+
+    /// Cap the number of matches printed (default: all).
+    #[arg(long, value_name = "N")]
+    limit: Option<usize>,
 }
 
 /// Arguments for `mbdb import`.
@@ -55,7 +93,61 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Command::Import(args) => run_import(&args),
+        Command::Query(args) => run_query(&args),
     }
+}
+
+fn run_query(args: &QueryArgs) {
+    let config_path = match args.config.as_ref() {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(DEFAULT_CONFIG_PATH),
+    };
+    let config = match Config::load(&config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    };
+    let overrides = CliOverrides {
+        dump_dir: None,
+        db: args.db.clone(),
+        tables: None,
+    };
+    let settings = match Settings::resolve(config.as_ref(), &overrides) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    let conn = match Connection::open(PathBuf::from(&settings.db)) {
+        Ok(conn) => conn,
+        Err(error) => {
+            eprintln!("error: could not open {}: {error}", settings.db);
+            std::process::exit(1);
+        }
+    };
+    let result = match &args.kind {
+        QueryKind::Artist(artist) => {
+            let options = QueryOptions {
+                limit: artist.limit,
+            };
+            query_artist(&conn, &artist.name, &options)
+        }
+    };
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_owned())
+    );
 }
 
 fn run_import(args: &ImportArgs) {

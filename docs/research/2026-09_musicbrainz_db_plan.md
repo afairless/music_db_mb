@@ -325,3 +325,27 @@ results, refresh-cycle record) per the house documentation conventions.
 - Also spot-verified against the dump while diagnosing: `track` gained `is_data_track` (12 columns,
   in the manifest), aliases keep a `sort_name` column in the export (16 columns), and `artist` peaks at
   19 columns — the pinned manifests match the shipped members field-for-field.
+
+### §R3 — Full release import (milestone-1 step 4)
+
+- Reference: `mbdb import` with defaults (`--dump-dir ~/musicbrainz_db/dumps`, `--db
+  ~/musicbrainz_db/musicbrainz.duckdb`, tables core+derived) against the 2026-09-30 002222 export
+  (`fullexport/20260930-002222/`; `mbdump.tar.bz2` 7.1 GB + `mbdump-derived.tar.bz2` 497 MB, both
+  MD5SUMS-verified — `mbdump.MD5SUMS` uses md5sum **binary-mode `*` markers**).
+- **Wall clock: 6 h 04 m** (16:44→22:48 on 2026-10-01) — above the plan's 30–180 min estimate; the
+  plan's budget assumed faster backpressure/IO; checkpoint/resume made the runtime a non-issue. Peak
+  RSS ~7.4 GB, constant-memory design held (no spill files written). DB finished at 13.2 GB.
+- Loaded **49 tables, 248,267,192 rows**, zero rejections, checkpoint totals == table counts,
+  `referential integrity: CLEAN`. Headline counts: track 58 166 762, recording 40 393 216,
+  url 21 975 488, release_country 13 302 253, l_release_url 10 715 151, l_artist_recording
+  18 974 102, release 5 814 410, medium 6 380 068, artist 2 999 670, artist_credit 3 891 400,
+  isrc 6 428 672, l_recording_work 7 921 893.
+- All other members were inventoried and reported `skipped (no pinned manifest)` (metadata files,
+  non-scope tables like `event`/`place`/`series`/tag/annotation/meta families, `l_*` link groups for
+  non-scope entities). The derived archive ships **no `l_*_wikidata` nor `recording_first_release_date`
+  members** in this snapshot (removed upstream since the plan's assumption was written); the
+  wikidata-bridge battery item thus falls back to the `url`+`l_*_url` path verified later.
+- Disk tripwire: the run was paused twice for cleanup (ENOSPC at ~4.9 GB free; user freed space);
+  resume semantics needed no `--resume` invocation — the run simply continued. Lesson: the
+  download + DB peak (≈ 7.9 GB archives + 13.2 GB DB + baseline) exceeds the original 59 GB-free
+  headroom estimate only marginally; keep ≥ 30 GB free before a refresh run.

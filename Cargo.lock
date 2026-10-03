@@ -892,6 +892,7 @@ dependencies = [
  "clap",
  "duckdb",
  "serde",
+ "serde_json",
  "tar",
  "tempfile",
  "thiserror",
