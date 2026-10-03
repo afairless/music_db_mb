@@ -1960,6 +1960,151 @@ fn fetch_work_aliases(
     Ok(out)
 }
 
+/// A wikidata link hit (plan §4.`query wikidata --mbid`).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WikidataHit {
+    pub kind: &'static str,
+    /// Which entity surface the mb résolves through ("artist",
+    /// "release_group", "release", "recording", or "work").
+    pub entity_kind: &'static str,
+    /// The entity name (e.g. the release group's name).
+    pub name: String,
+    /// The input gid, echoed back.
+    pub mbid: String,
+    /// The Wikidata QID extracted from the linked url
+    /// (`https://www.wikidata.org/wiki/Q…` → `Q…`).
+    pub qid: String,
+    /// The full linked url.
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct WikidataLookup {
+    kind: &'static str,
+    entity_table: &'static str,
+    link_table: &'static str,
+    /// `l_url_work` is alphabetical (url before work), so the entity
+    /// sits in entity1 and the url in entity0 — the reverse of the
+    /// other `l_<entity>_url` tables.
+    reverse: bool,
+}
+
+/// The wikidata link surfaces, in scan order.
+const WIKIDATA_LOOKUPS: &[WikidataLookup] = &[
+    WikidataLookup {
+        kind: "artist",
+        entity_table: "artist",
+        link_table: "l_artist_url",
+        reverse: false,
+    },
+    WikidataLookup {
+        kind: "release_group",
+        entity_table: "release_group",
+        link_table: "l_release_group_url",
+        reverse: false,
+    },
+    WikidataLookup {
+        kind: "release",
+        entity_table: "release",
+        link_table: "l_release_url",
+        reverse: false,
+    },
+    WikidataLookup {
+        kind: "recording",
+        entity_table: "recording",
+        link_table: "l_recording_url",
+        reverse: false,
+    },
+    WikidataLookup {
+        kind: "work",
+        entity_table: "work",
+        link_table: "l_url_work",
+        reverse: true,
+    },
+];
+
+/// Query the Wikidata link for an MBID (plan §4.`query wikidata --mbid`).
+///
+/// The primary (verified) bridge: `url` + `l_<entity>_url` rows whose
+/// `link` resolves to link_type `wikidata`, with the QID extracted from
+/// the wikidata url. The derived `l_*_wikidata` snapshot tables are not
+/// used — the §R3 full-import inventory confirmed the schema-31 exports
+/// ship no such members, so the url bridge is the only live path. Every
+/// match is surfaced (an mbid rarely links more than one wikidata url;
+/// if it ever does, all of them show).
+pub fn query_wikidata(
+    conn: &Connection,
+    mbid: &str,
+    options: &QueryOptions,
+) -> Result<QueryResult<WikidataHit>, QueryError> {
+    let query = mbid.trim();
+    if query.is_empty() {
+        return Err(QueryError::EmptyQuery);
+    }
+
+    let mut matches: Vec<WikidataHit> = Vec::new();
+    for lookup in WIKIDATA_LOOKUPS {
+        let hits = lookup_wikidata(conn, lookup, query)?;
+        for hit in hits {
+            matches.push(hit);
+        }
+    }
+    if let Some(limit) = options.limit {
+        matches.truncate(limit);
+    }
+
+    Ok(QueryResult {
+        kind: "wikidata",
+        query: query.to_owned(),
+        matches,
+    })
+}
+
+/// One entity's wikidata links via its `l_<entity>_url` bridge.
+fn lookup_wikidata(
+    conn: &Connection,
+    lookup: &WikidataLookup,
+    gid: &str,
+) -> Result<Vec<WikidataHit>, QueryError> {
+    let (entity_side, url_side) = if lookup.reverse {
+        ("l.entity1", "l.entity0")
+    } else {
+        ("l.entity0", "l.entity1")
+    };
+    let sql = format!(
+        "SELECT e.name, e.gid, u.url, \
+                regexp_replace(u.url, '.*/', '') AS qid \
+         FROM {} e \
+         JOIN {} l ON {} = e.id \
+         JOIN link k ON l.link = k.id \
+         JOIN link_type lt ON k.link_type = lt.id \
+         JOIN url u ON {} = u.id \
+         WHERE e.gid = ? AND lt.name = 'wikidata' \
+         ORDER BY l.id",
+        lookup.entity_table, lookup.link_table, entity_side, url_side,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![gid], |row| {
+        let name: String = row.get(0)?;
+        let mbid: String = row.get(1)?;
+        let url: String = row.get(2)?;
+        let qid: String = row.get(3)?;
+        Ok(WikidataHit {
+            kind: "wikidata",
+            entity_kind: lookup.kind,
+            name,
+            mbid,
+            qid,
+            url,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// Build `?,?,?,…` for an `IN` clause.
 fn in_placeholders(count: usize) -> String {
     vec!["?"; count].join(", ")
@@ -3266,6 +3411,250 @@ mod tests {
         let actual = serde_json::to_string(&result).unwrap();
         let expected =
             fs::read_to_string(golden_path("query_work_with_or_without_you.json")).unwrap();
+        assert_eq!(format!("{actual}\n"), expected);
+    }
+    // ------------------------------------------------------------------ //
+    //  Wikidata query tests                                             //
+    // ------------------------------------------------------------------ //
+
+    /// In-memory DuckDB mirroring the loader's target surface for the
+    /// wikidata query: every entity surface plus the url bridge,
+    /// including the reversed `l_url_work` table. The QIDs are the
+    /// verified live links (U2 → Q396, The Joshua Tree → Q152873,
+    /// With or Without You → Q1131812, …).
+    fn wikidata_fixture_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE artist (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL
+             );
+             CREATE TABLE release_group (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL,
+                 artist_credit INTEGER NOT NULL
+             );
+             CREATE TABLE release (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL,
+                 artist_credit INTEGER NOT NULL,
+                 release_group INTEGER NOT NULL
+             );
+             CREATE TABLE recording (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL,
+                 artist_credit INTEGER NOT NULL
+             );
+             CREATE TABLE work (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL
+             );
+             CREATE TABLE url (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 url VARCHAR NOT NULL
+             );
+             CREATE TABLE link_type (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 entity_type0 VARCHAR NOT NULL,
+                 entity_type1 VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL,
+                 link_phrase VARCHAR NOT NULL,
+                 reverse_link_phrase VARCHAR NOT NULL,
+                 long_link_phrase VARCHAR NOT NULL
+             );
+             CREATE TABLE link (
+                 id INTEGER PRIMARY KEY,
+                 link_type INTEGER NOT NULL
+             );
+             CREATE TABLE l_artist_url (
+                 id INTEGER PRIMARY KEY,
+                 link INTEGER NOT NULL,
+                 entity0 INTEGER NOT NULL,
+                 entity1 INTEGER NOT NULL
+             );
+             CREATE TABLE l_release_group_url (
+                 id INTEGER PRIMARY KEY,
+                 link INTEGER NOT NULL,
+                 entity0 INTEGER NOT NULL,
+                 entity1 INTEGER NOT NULL
+             );
+             CREATE TABLE l_release_url (
+                 id INTEGER PRIMARY KEY,
+                 link INTEGER NOT NULL,
+                 entity0 INTEGER NOT NULL,
+                 entity1 INTEGER NOT NULL
+             );
+             CREATE TABLE l_recording_url (
+                 id INTEGER PRIMARY KEY,
+                 link INTEGER NOT NULL,
+                 entity0 INTEGER NOT NULL,
+                 entity1 INTEGER NOT NULL
+             );
+             CREATE TABLE l_url_work (
+                 id INTEGER PRIMARY KEY,
+                 link INTEGER NOT NULL,
+                 entity0 INTEGER NOT NULL,
+                 entity1 INTEGER NOT NULL
+             );
+             INSERT INTO artist (id, gid, name) VALUES
+                (1, 'a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432', 'U2');
+             INSERT INTO release_group (id, gid, name, artist_credit) VALUES
+                (1, '6f3e9fa6-acd3-4ce0-8f36-1e5aa6a18432', 'The Joshua Tree', 1);
+             INSERT INTO release (id, gid, name, artist_credit, release_group) VALUES
+                (1, 'rel-joshua-tree-gid', 'The Joshua Tree', 1, 1);
+             INSERT INTO recording (id, gid, name, artist_credit) VALUES
+                (1, 'rec-joshua-tree-gid', 'Where the Streets Have No Name', 1);
+             INSERT INTO work (id, gid, name) VALUES
+                (172336, 'c90fe41d-9409-377b-aa32-3d0730d0e865', 'With or Without You');
+             INSERT INTO url (id, gid, url) VALUES
+                (1, 'url-u2-gid', 'https://www.wikidata.org/wiki/Q396'),
+                (2, 'url-jt-gid', 'https://www.wikidata.org/wiki/Q152873'),
+                (3, 'url-rel-gid', 'https://www.wikidata.org/wiki/Q123456'),
+                (4, 'url-rec-gid', 'https://www.wikidata.org/wiki/Q2290594'),
+                (5, 'url-work-gid', 'https://www.wikidata.org/wiki/Q1131812'),
+                (6, 'url-extra-gid', 'https://www.wikidata.org/wiki/Q777777');
+             INSERT INTO link_type (id, gid, entity_type0, entity_type1, name,
+                                     link_phrase, reverse_link_phrase, long_link_phrase) VALUES
+                (1, 'lt-wikidata-gid', 'url', 'artist', 'wikidata',
+                 'Wikidata', 'Wikidata', 'Wikidata');
+             INSERT INTO link (id, link_type) VALUES
+                (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1);
+             INSERT INTO l_artist_url (id, link, entity0, entity1) VALUES
+                (1, 1, 1, 1);
+             INSERT INTO l_release_group_url (id, link, entity0, entity1) VALUES
+                (2, 2, 1, 2),
+                (5, 6, 1, 6);
+             INSERT INTO l_release_url (id, link, entity0, entity1) VALUES
+                (3, 3, 1, 3);
+             INSERT INTO l_recording_url (id, link, entity0, entity1) VALUES
+                (4, 4, 1, 4);
+             INSERT INTO l_url_work (id, link, entity0, entity1) VALUES
+                (6, 5, 5, 172336);",
+        )
+        .expect("seed wikidata fixture");
+        conn
+    }
+
+    #[test]
+    fn wikidata_resolves_each_entity_kind() {
+        let conn = wikidata_fixture_conn();
+        // The artist surface resolves via l_artist_url (entity0).
+        let u2 = query_wikidata(
+            &conn,
+            "a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(u2.matches.len(), 1);
+        assert_eq!(u2.matches[0].entity_kind, "artist");
+        assert_eq!(u2.matches[0].mbid, "a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432");
+        assert_eq!(u2.matches[0].name, "U2");
+        assert_eq!(u2.matches[0].qid, "Q396");
+
+        // The release surface resolves via l_release_url.
+        let rel = query_wikidata(&conn, "rel-joshua-tree-gid", &QueryOptions::default()).unwrap();
+        assert_eq!(rel.matches.len(), 1);
+        assert_eq!(rel.matches[0].entity_kind, "release");
+        assert_eq!(rel.matches[0].qid, "Q123456");
+
+        // The recording surface resolves via l_recording_url.
+        let rec = query_wikidata(&conn, "rec-joshua-tree-gid", &QueryOptions::default()).unwrap();
+        assert_eq!(rec.matches.len(), 1);
+        assert_eq!(rec.matches[0].entity_kind, "recording");
+        assert_eq!(rec.matches[0].qid, "Q2290594");
+    }
+
+    #[test]
+    fn wikidata_work_uses_reverse_link_table() {
+        let conn = wikidata_fixture_conn();
+        // l_url_work is alphabetical: entity0 = url, entity1 = work.
+        let result = query_wikidata(
+            &conn,
+            "c90fe41d-9409-377b-aa32-3d0730d0e865",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.matches.len(), 1);
+        let hit = &result.matches[0];
+        assert_eq!(hit.entity_kind, "work");
+        assert_eq!(hit.name, "With or Without You");
+        assert_eq!(hit.qid, "Q1131812");
+        assert_eq!(hit.url, "https://www.wikidata.org/wiki/Q1131812");
+    }
+
+    #[test]
+    fn wikidata_surfaces_every_link() {
+        let conn = wikidata_fixture_conn();
+        // The release group carries two wikidata urls; both surface, in
+        // link junction order — no silent filtering.
+        let result = query_wikidata(
+            &conn,
+            "6f3e9fa6-acd3-4ce0-8f36-1e5aa6a18432",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.matches.len(), 2);
+        assert_eq!(result.matches[0].qid, "Q152873");
+        assert_eq!(result.matches[1].qid, "Q777777");
+    }
+
+    #[test]
+    fn wikidata_unknown_mbid_returns_empty() {
+        let conn = wikidata_fixture_conn();
+        let result = query_wikidata(
+            &conn,
+            "00000000-0000-4000-8000-000000000000",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(result.matches.is_empty());
+        assert_eq!(result.query, "00000000-0000-4000-8000-000000000000");
+    }
+
+    #[test]
+    fn wikidata_empty_mbid_is_an_error() {
+        let conn = wikidata_fixture_conn();
+        assert!(matches!(
+            query_wikidata(&conn, "", &QueryOptions::default()),
+            Err(QueryError::EmptyQuery)
+        ));
+        assert!(matches!(
+            query_wikidata(&conn, "   ", &QueryOptions::default()),
+            Err(QueryError::EmptyQuery)
+        ));
+    }
+
+    #[test]
+    fn wikidata_limit_applies() {
+        let conn = wikidata_fixture_conn();
+        let result = query_wikidata(
+            &conn,
+            "6f3e9fa6-acd3-4ce0-8f36-1e5aa6a18432",
+            &QueryOptions { limit: Some(1) },
+        )
+        .unwrap();
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].qid, "Q152873");
+    }
+
+    #[test]
+    fn wikidata_golden_json_contract() {
+        let conn = wikidata_fixture_conn();
+        let result = query_wikidata(
+            &conn,
+            "6f3e9fa6-acd3-4ce0-8f36-1e5aa6a18432",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let actual = serde_json::to_string(&result).unwrap();
+        let expected = fs::read_to_string(golden_path("query_wikidata_joshua_tree.json")).unwrap();
         assert_eq!(format!("{actual}\n"), expected);
     }
 }

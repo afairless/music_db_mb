@@ -29,6 +29,36 @@ docs/research/2026-09_musicbrainz_db_plan.md   # the plan (status: Proposed)
 ~/musicbrainz_db/musicbrainz.duckdb             # built database (config default)
 ```
 
+## Query surface
+
+`mbdb query <kind> …` prints one JSON document per run (the §4 contract): name-first,
+exact-match-first ranking with stable id/gid tiebreakers, aliases + disambiguation surfaced,
+and **no silent filtering** — statuses, disambiguated duplicates, and the long tail stay
+visible for the LLM to judge. Durations are seconds (ms → s) matching the mp3-side convention.
+
+```text
+# Artists — exact name first, then sort_name/alias, then substring
+mbdb query artist --name U2
+
+# Release groups — types, first-release-date, artist credit
+mbdb query release-group --name "The Joshua Tree" [--artist U2] [--type Album]
+
+# Releases of a group — status/date/country/label; --inc-tracks adds tracklists
+mbdb query release --release-group 6f3e9fa6-be7a-3de8-a2b2-2072ece8a54d [--inc-tracks]
+
+# Recordings — duration seconds, first release date (best effort), artist credit
+mbdb query recording --name "Where the Streets Have No Name" [--artist U2]
+
+# Works — ISWCs, raw type id, composer links
+mbdb query work --name "With or Without You" [--composer Bono]
+
+# Wikidata bridge — MBID → QID via the verified url + l_<entity>_url path
+mbdb query wikidata --mbid 6f3e9fa6-be7a-3de8-a2b2-2072ece8a54d
+```
+
+Every query honors `--limit N` (applied after ranking). Call the same functions from Rust via
+`src/mbdb/query.rs` (`mbdb::query::query_*)`.
+
 ## Related projects
 
 - Consumer: tag_agent → `/home/tr/Documents/tag_agent/docs/ARCHITECTURE-proposal.md` (decision D10)

@@ -9,7 +9,8 @@ use duckdb::Connection;
 
 use mbdb::manifest::{ALL, table};
 use mbdb::query::{
-    QueryOptions, query_artist, query_recording, query_release, query_release_group, query_work,
+    QueryOptions, query_artist, query_recording, query_release, query_release_group,
+    query_wikidata, query_work,
 };
 use mbdb::schema::{create_schema, ddl};
 
@@ -215,7 +216,17 @@ fn seed_query_tables(conn: &mut Connection) {
          INSERT INTO link (id, link_type) VALUES
             (2, 2);
          INSERT INTO l_artist_work (id, link, entity0, entity1) VALUES
-            (1, 2, 1, 1);"
+            (1, 2, 1, 1);
+         INSERT INTO url (id, gid, url) VALUES
+            (1, 'url-jt-gid', 'https://www.wikidata.org/wiki/Q152873');
+         INSERT INTO link_type (id, gid, entity_type0, entity_type1, name,
+                                link_phrase, reverse_link_phrase, long_link_phrase) VALUES
+            (3, 'lt-wikidata-gid', 'url', 'release_group', 'wikidata',
+             'Wikidata', 'Wikidata', 'Wikidata');
+         INSERT INTO link (id, link_type) VALUES
+            (3, 3);
+         INSERT INTO l_release_group_url (id, link, entity0, entity1) VALUES
+            (1, 3, 1, 1);"
     )
     .unwrap();
 }
@@ -354,6 +365,38 @@ fn smoke_work_query_binds_to_real_schema() {
         &conn,
         "With or Without You",
         Some("Nobody"),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert!(none.matches.is_empty());
+}
+
+#[test]
+fn smoke_wikidata_query_binds_to_real_schema() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    create_schema(&mut conn).unwrap();
+    seed_query_tables(&mut conn);
+
+    // The wikidata query binds to the real column set: the whole link
+    // chain (l_release_group_url → link → link_type filter → url) and
+    // the QID extraction regex.
+    let result = query_wikidata(
+        &conn,
+        "6f3e9fa6-acd3-4ce0-8f36-1e5aa6a18432",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(result.matches.len(), 1);
+    let hit = &result.matches[0];
+    assert_eq!(hit.entity_kind, "release_group");
+    assert_eq!(hit.name, "The Joshua Tree");
+    assert_eq!(hit.qid, "Q152873");
+    assert_eq!(hit.url, "https://www.wikidata.org/wiki/Q152873");
+
+    // An mbid with no wikidata link (the artist here) yields nothing.
+    let none = query_wikidata(
+        &conn,
+        "a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432",
         &QueryOptions::default(),
     )
     .unwrap();
