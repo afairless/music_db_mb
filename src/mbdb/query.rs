@@ -613,7 +613,7 @@ fn fetch_secondary_types(
          FROM release_group_secondary_type_join rgstj \
          JOIN release_group_secondary_type rgst ON rgstj.secondary_type = rgst.id \
          WHERE rgstj.release_group IN ({}) \
-         ORDER BY rgstj.id",
+         ORDER BY rgstj.release_group, rgstj.secondary_type",
         in_placeholders(rg_ids.len())
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -1024,7 +1024,6 @@ mod tests {
                  primary_for_locale BOOLEAN NOT NULL DEFAULT FALSE
              );
              CREATE TABLE release_group_secondary_type_join (
-                 id INTEGER PRIMARY KEY,
                  release_group INTEGER NOT NULL,
                  secondary_type INTEGER NOT NULL
              );
@@ -1071,8 +1070,8 @@ mod tests {
              INSERT INTO release_group_alias (id, release_group, name, locale, primary_for_locale) VALUES
                 (1, 1, '约书亚树', 'zh-cn', TRUE),
                 (2, 2, 'Avenue Q (musical)', NULL, FALSE);
-             INSERT INTO release_group_secondary_type_join (id, release_group, secondary_type) VALUES
-                (1, 2, 1);
+             INSERT INTO release_group_secondary_type_join (release_group, secondary_type) VALUES
+                (2, 1);
              INSERT INTO release (id, gid, name, release_group, artist_credit) VALUES
                 (1, 'rel-joshua-tree-gid', 'The Joshua Tree', 1, 1),
                 (2, 'rel-avenue-q-gid', 'Avenue Q: The Musical (Original Cast)', 2, 2);

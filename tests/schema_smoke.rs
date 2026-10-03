@@ -8,6 +8,7 @@
 use duckdb::Connection;
 
 use mbdb::manifest::{ALL, table};
+use mbdb::query::{QueryOptions, query_artist, query_release_group};
 use mbdb::schema::{create_schema, ddl};
 
 /// Query helper: count rows in `information_schema.tables` matching a name.
@@ -132,4 +133,81 @@ fn smoke_load_order_resolves_track_recording_fk() {
         )
         .unwrap();
     assert_eq!(table_count(&conn, "track"), 1);
+}
+
+// ------------------------------------------------------------------ //
+//  Query binding against the real schema                             //
+// ------------------------------------------------------------------ //
+
+/// Seed the real 50-table DDL with the rows the name-first query layer
+/// reads. Column sets here are the pinned schema-31 shapes (no fake
+/// columns, no skipped CHECK constraints), so a SQL statement that binds
+/// to the wrong column set fails this test rather than in production.
+fn seed_query_tables(conn: &mut Connection) {
+    conn.execute_batch(
+        "INSERT INTO artist (id, gid, name, sort_name, comment) VALUES
+            (1, 'a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432', 'U2', 'U2', 'Irish rock band'),
+            (2, '22222222-2222-4222-8222-222222222222', 'The Beatles', 'The Beatles', 'The Fab Four');
+         INSERT INTO artist_alias (id, artist, name, sort_name, locale, primary_for_locale) VALUES
+            (1, 1, '유투', '유투', 'ko', TRUE),
+            (2, 2, 'Beatles, The', 'Beatles, The', NULL, FALSE);
+         INSERT INTO artist_credit (id, name, artist_count, gid) VALUES
+            (1, 'U2', 1, 'ac-u2-gid');
+         INSERT INTO artist_credit_name (artist_credit, position, artist, name, join_phrase) VALUES
+            (1, 1, 1, 'U2', '');
+         INSERT INTO release_group_primary_type (id, name, gid) VALUES
+            (1, 'Album', 'pt-album-gid');
+         INSERT INTO release_group_secondary_type (id, name, gid) VALUES
+            (1, 'Cast', 'st-cast-gid');
+         INSERT INTO release_group (id, gid, name, artist_credit, type) VALUES
+            (1, '6f3e9fa6-acd3-4ce0-8f36-1e5aa6a18432', 'The Joshua Tree', 1, 1);
+         INSERT INTO release_group_alias (id, release_group, name, sort_name, locale, primary_for_locale) VALUES
+            (1, 1, '约书亚树', '约书亚树', 'zh-cn', TRUE);
+         -- The shipped join table carries NO surrogate id: the secondary-
+         -- type fetch must order by the natural key (regression guard for
+         -- the old `rgstj.id` binder error on the live database).
+         INSERT INTO release_group_secondary_type_join (release_group, secondary_type) VALUES
+            (1, 1);
+         INSERT INTO release_status (id, name, parent, child_order, description, gid) VALUES
+            (1, 'Official', NULL, 0, NULL, 'rs-official-gid');
+         INSERT INTO area (id, gid, name, type) VALUES
+            (1, 'area-us-gid', 'United States', NULL);
+         INSERT INTO release (id, gid, name, artist_credit, release_group, status) VALUES
+            (1, 'rel-joshua-tree-gid', 'The Joshua Tree', 1, 1, 1);
+         INSERT INTO release_country (release, country, date_year, date_month, date_day) VALUES
+            (1, 1, 1987, 3, 9);"
+    )
+    .unwrap();
+}
+
+#[test]
+fn smoke_queries_bind_to_real_schema() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    create_schema(&mut conn).unwrap();
+    seed_query_tables(&mut conn);
+
+    // The artist query binds to the real column set (comment →
+    // disambiguation, aliases via artist_alias).
+    let artist = query_artist(&conn, "U2", &QueryOptions::default()).unwrap();
+    assert_eq!(artist.matches.len(), 1);
+    assert_eq!(artist.matches[0].disambiguation, "Irish rock band");
+    assert_eq!(artist.matches[0].aliases.len(), 1);
+
+    // The release-group query binds to the real column set — above all
+    // the secondary-type join without an id column.
+    let rg = query_release_group(
+        &conn,
+        "The Joshua Tree",
+        None,
+        None,
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(rg.matches.len(), 1);
+    assert_eq!(rg.matches[0].mbid, "6f3e9fa6-acd3-4ce0-8f36-1e5aa6a18432");
+    assert_eq!(rg.matches[0].types, vec!["Album", "Cast"]);
+    assert_eq!(
+        rg.matches[0].first_release_date.as_deref(),
+        Some("1987-03-09")
+    );
 }
