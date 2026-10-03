@@ -1240,6 +1240,387 @@ fn fetch_release_tracklists(
     Ok(out)
 }
 
+/// A matched recording (contract shape, plan §4).
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordingHit {
+    pub kind: &'static str,
+    pub name: String,
+    /// The recording `gid`, exposed as `mbid`.
+    pub mbid: String,
+    /// Recorded length in seconds (`recording.length` ms → s); `None`
+    /// when unknown. Matches the mp3-side `duration_seconds` f64
+    /// convention (tag_tool contract).
+    pub duration_seconds: Option<f64>,
+    /// Earliest release date reachable via `l_recording_release`, same
+    /// `YYYY-MM-DD` rendering as the release-group date. The shipped
+    /// link table is sparse (~1.3 k rows), so this is `None` for most
+    /// recordings — surfaced as-is, never estimated.
+    pub first_release_date: Option<String>,
+    /// The recording's artist credit.
+    pub artist_credit: Vec<ArtistCreditEntry>,
+    /// All of the recording's aliases, ordered by alias id.
+    pub aliases: Vec<AliasHit>,
+}
+
+/// Query recordings by name (plan §4.`query recording --name [--artist]`).
+///
+/// Match tiers (same exact-first contract as `query_artist`, minus
+/// sort_name — recordings carry none):
+///
+/// 0. exact `name`
+/// 1. exact alias
+/// 2. substring `name`
+/// 3. substring alias
+///
+/// Optional `--artist` filters to recordings whose artist credit name
+/// matches (exact or substring), same semantics as the release-group
+/// filter.
+pub fn query_recording(
+    conn: &Connection,
+    name: &str,
+    artist: Option<&str>,
+    options: &QueryOptions,
+) -> Result<QueryResult<RecordingHit>, QueryError> {
+    let query = name.trim();
+    if query.is_empty() {
+        return Err(QueryError::EmptyQuery);
+    }
+
+    // Gate 1 — recording rows matching on name.
+    let mut candidate_ids: HashSet<i64> = HashSet::new();
+    {
+        let sql = "SELECT id FROM recording \
+                   WHERE name = ?1 OR contains(name, ?2)";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![query, query], |row| row.get::<_, i64>(0))?;
+        for id in rows {
+            candidate_ids.insert(id?);
+        }
+    }
+
+    // Gate 2 — alias rows matching the query.
+    let mut alias_exact: HashSet<i64> = HashSet::new();
+    let mut alias_substring: HashSet<i64> = HashSet::new();
+    {
+        let sql = "SELECT recording, name FROM recording_alias \
+                   WHERE name = ?1 OR contains(name, ?2)";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![query, query], |row| {
+            let recording: i64 = row.get(0)?;
+            let alias: String = row.get(1)?;
+            Ok((recording, alias))
+        })?;
+        for row in rows {
+            let (recording, alias) = row?;
+            if alias == query {
+                alias_exact.insert(recording);
+            }
+            if alias.contains(query) {
+                alias_substring.insert(recording);
+            }
+        }
+    }
+
+    candidate_ids.extend(alias_exact.iter().copied());
+    candidate_ids.extend(alias_substring.iter().copied());
+    if candidate_ids.is_empty() {
+        return Ok(QueryResult {
+            kind: "recording",
+            query: query.to_owned(),
+            matches: Vec::new(),
+        });
+    }
+
+    // Filter by --artist (artist credit name contains the filter).
+    if let Some(artist_filter) = artist {
+        let trimmed = artist_filter.trim();
+        if !trimmed.is_empty() {
+            let ids = candidate_ids.into_iter().collect::<Vec<_>>();
+            let mut filtered: HashSet<i64> = HashSet::new();
+            let in_clause = in_placeholders(ids.len());
+            let sql = format!(
+                "SELECT DISTINCT rec.id \
+                 FROM recording rec \
+                 JOIN artist_credit_name acn ON rec.artist_credit = acn.artist_credit \
+                 WHERE rec.id IN ({}) \
+                   AND (acn.name = ? OR contains(acn.name, ?))",
+                in_clause
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut all_params: Vec<duckdb::types::Value> = Vec::new();
+            for id in ids {
+                all_params.push(duckdb::types::Value::BigInt(id));
+            }
+            all_params.push(duckdb::types::Value::Text(trimmed.to_string()));
+            all_params.push(duckdb::types::Value::Text(trimmed.to_string()));
+            let rows = stmt.query_map(params_from_iter(all_params.iter()), |row| {
+                row.get::<_, i64>(0)
+            })?;
+            for id in rows {
+                filtered.insert(id?);
+            }
+            candidate_ids = filtered;
+            if candidate_ids.is_empty() {
+                return Ok(QueryResult {
+                    kind: "recording",
+                    query: query.to_owned(),
+                    matches: Vec::new(),
+                });
+            }
+        }
+    }
+
+    // Fetch the full rows for every candidate id.
+    let ids: Vec<i64> = candidate_ids.into_iter().collect();
+    let mut rows = fetch_recording_rows(conn, &ids)?;
+    for row in rows.iter_mut() {
+        row.rank = if row.name == query {
+            TIER_NAME_EXACT
+        } else if alias_exact.contains(&row.id) {
+            TIER_ALIAS_EXACT
+        } else if row.name.contains(query) {
+            TIER_NAME_SUBSTRING
+        } else {
+            TIER_ALIAS_SUBSTRING
+        };
+    }
+
+    // Deterministic order: tier, then name, then id (stable tiebreaker).
+    rows.sort_by(|a, b| (a.rank, a.name.as_str(), a.id).cmp(&(b.rank, b.name.as_str(), b.id)));
+    if let Some(limit) = options.limit {
+        rows.truncate(limit);
+    }
+
+    // Batch-fetch the extra columns for the surfaced hits.
+    let hit_ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+    let first_dates = fetch_recording_first_dates(conn, &hit_ids)?;
+    let credit = fetch_recording_artist_credits(conn, &hit_ids)?;
+    let aliases = fetch_recording_aliases(conn, &hit_ids)?;
+
+    let matches = rows
+        .into_iter()
+        .map(|row| {
+            let first_date: Option<String> = match first_dates.get(&row.id) {
+                Some(v) => v.clone(),
+                None => None,
+            };
+            let credit_vec: Vec<ArtistCreditEntry> = match credit.get(&row.id) {
+                Some(v) => v.clone(),
+                None => Vec::new(),
+            };
+            let alias_vec: Vec<AliasHit> = match aliases.get(&row.id) {
+                Some(v) => v.clone(),
+                None => Vec::new(),
+            };
+            RecordingHit {
+                kind: "recording",
+                name: row.name.clone(),
+                mbid: row.gid.clone(),
+                duration_seconds: row.length.map(|ms| (ms as f64) / 1000.0),
+                first_release_date: first_date,
+                artist_credit: credit_vec,
+                aliases: alias_vec,
+            }
+        })
+        .collect();
+
+    Ok(QueryResult {
+        kind: "recording",
+        query: query.to_owned(),
+        matches,
+    })
+}
+
+/// Ranked recording candidate row (internal).
+struct RecordingCandidate {
+    id: i64,
+    gid: String,
+    name: String,
+    length: Option<i64>,
+    rank: u8,
+}
+
+/// Fetch recording rows for the given ids.
+fn fetch_recording_rows(
+    conn: &Connection,
+    ids: &[i64],
+) -> Result<Vec<RecordingCandidate>, QueryError> {
+    let sql = format!(
+        "SELECT id, gid, name, length FROM recording WHERE id IN ({})",
+        in_placeholders(ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params_from_iter(ids.iter().map(|id| duckdb::types::Value::BigInt(*id))),
+        |row| {
+            Ok(RecordingCandidate {
+                id: row.get(0)?,
+                gid: row.get(1)?,
+                name: row.get(2)?,
+                length: row.get::<_, Option<i64>>(3)?,
+                rank: 0,
+            })
+        },
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Map from recording id to its first release date, computed across the
+/// releases reachable via `l_recording_release` (entity0 = recording,
+/// entity1 = release).
+fn fetch_recording_first_dates(
+    conn: &Connection,
+    recording_ids: &[i64],
+) -> Result<std::collections::BTreeMap<i64, Option<String>>, QueryError> {
+    let mut out: std::collections::BTreeMap<i64, Option<String>> = Default::default();
+    if recording_ids.is_empty() {
+        return Ok(out);
+    }
+    let sql = format!(
+        "SELECT entity0, MIN(date_str) AS first_date \
+         FROM ( \
+           SELECT lrr.entity0, \
+               printf('%04d-%02d-%02d', rc.date_year, \
+                   COALESCE(rc.date_month, 1), COALESCE(rc.date_day, 1)) AS date_str \
+           FROM l_recording_release lrr \
+           JOIN release r ON lrr.entity1 = r.id \
+           JOIN release_country rc ON r.id = rc.release \
+           WHERE lrr.entity0 IN ({}) AND rc.date_year IS NOT NULL \
+           UNION ALL \
+           SELECT lrr.entity0, \
+               printf('%04d-%02d-%02d', ruc.date_year, \
+                   COALESCE(ruc.date_month, 1), COALESCE(ruc.date_day, 1)) AS date_str \
+           FROM l_recording_release lrr \
+           JOIN release r ON lrr.entity1 = r.id \
+           JOIN release_unknown_country ruc ON r.id = ruc.release \
+           WHERE lrr.entity0 IN ({}) AND ruc.date_year IS NOT NULL \
+         ) sub \
+         GROUP BY entity0",
+        in_placeholders(recording_ids.len()),
+        in_placeholders(recording_ids.len()),
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut all_params: Vec<duckdb::types::Value> = Vec::new();
+    for _ in 0..2 {
+        for id in recording_ids {
+            all_params.push(duckdb::types::Value::BigInt(*id));
+        }
+    }
+    let rows = stmt.query_map(params_from_iter(all_params.iter()), |row| {
+        let recording_id: i64 = row.get(0)?;
+        let date_str: Option<String> = row.get(1)?;
+        Ok((recording_id, date_str))
+    })?;
+    for row in rows {
+        let (recording_id, date_str) = row?;
+        if let Some(d) = date_str {
+            out.insert(recording_id, Some(d));
+        }
+    }
+    for id in recording_ids {
+        if !out.contains_key(id) {
+            out.insert(*id, None);
+        }
+    }
+    Ok(out)
+}
+
+/// Map from recording id to its artist credit (ordered by position).
+fn fetch_recording_artist_credits(
+    conn: &Connection,
+    recording_ids: &[i64],
+) -> Result<std::collections::BTreeMap<i64, Vec<ArtistCreditEntry>>, QueryError> {
+    let mut out: std::collections::BTreeMap<i64, Vec<ArtistCreditEntry>> = Default::default();
+    if recording_ids.is_empty() {
+        return Ok(out);
+    }
+    let sql = format!(
+        "SELECT rec.id AS recording_id, a.name AS artist_name, a.gid, a.comment \
+         FROM recording rec \
+         JOIN artist_credit_name acn ON rec.artist_credit = acn.artist_credit \
+         JOIN artist a ON acn.artist = a.id \
+         WHERE rec.id IN ({}) \
+         ORDER BY rec.id, acn.position",
+        in_placeholders(recording_ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params_from_iter(
+            recording_ids
+                .iter()
+                .map(|id| duckdb::types::Value::BigInt(*id)),
+        ),
+        |row| {
+            let recording_id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            let gid: String = row.get(2)?;
+            let comment: Option<String> = row.get::<_, Option<String>>(3)?;
+            Ok((
+                recording_id,
+                ArtistCreditEntry {
+                    name,
+                    mbid: gid,
+                    disambiguation: comment.unwrap_or_default(),
+                },
+            ))
+        },
+    )?;
+    for row in rows {
+        let (recording_id, entry) = row?;
+        out.entry(recording_id).or_default().push(entry);
+    }
+    Ok(out)
+}
+
+/// Map from recording id to its aliases (ordered by alias id).
+fn fetch_recording_aliases(
+    conn: &Connection,
+    recording_ids: &[i64],
+) -> Result<std::collections::BTreeMap<i64, Vec<AliasHit>>, QueryError> {
+    let mut out: std::collections::BTreeMap<i64, Vec<AliasHit>> = Default::default();
+    if recording_ids.is_empty() {
+        return Ok(out);
+    }
+    let sql = format!(
+        "SELECT recording, name, locale, primary_for_locale \
+         FROM recording_alias \
+         WHERE recording IN ({}) \
+         ORDER BY id",
+        in_placeholders(recording_ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params_from_iter(
+            recording_ids
+                .iter()
+                .map(|id| duckdb::types::Value::BigInt(*id)),
+        ),
+        |row| {
+            let recording_id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            let locale: Option<String> = row.get(2)?;
+            let primary_for_locale: bool = row.get(3)?;
+            Ok((
+                recording_id,
+                AliasHit {
+                    name,
+                    locale,
+                    primary_for_locale,
+                },
+            ))
+        },
+    )?;
+    for row in rows {
+        let (recording_id, alias) = row?;
+        out.entry(recording_id).or_default().push(alias);
+    }
+    Ok(out)
+}
+
 /// Build `?,?,?,…` for an `IN` clause.
 fn in_placeholders(count: usize) -> String {
     vec!["?"; count].join(", ")
@@ -2081,6 +2462,259 @@ mod tests {
         .unwrap();
         let actual = serde_json::to_string(&result).unwrap();
         let expected = fs::read_to_string(golden_path("query_release_joshua_tree.json")).unwrap();
+        assert_eq!(format!("{actual}\n"), expected);
+    }
+    // ------------------------------------------------------------------ //
+    //  Recording query tests                                            //
+    // ------------------------------------------------------------------ //
+
+    /// In-memory DuckDB mirroring the loader's target surface for the
+    /// recording query (pinned schema-31 column sets only).
+    fn recording_fixture_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE artist (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL,
+                 sort_name VARCHAR NOT NULL,
+                 comment VARCHAR NOT NULL DEFAULT ''
+             );
+             CREATE TABLE artist_credit (
+                 id INTEGER PRIMARY KEY,
+                 name VARCHAR NOT NULL,
+                 artist_count SMALLINT NOT NULL,
+                 gid VARCHAR NOT NULL
+             );
+             CREATE TABLE artist_credit_name (
+                 artist_credit INTEGER NOT NULL,
+                 position SMALLINT NOT NULL,
+                 artist INTEGER NOT NULL,
+                 name VARCHAR NOT NULL,
+                 join_phrase VARCHAR NOT NULL DEFAULT ''
+             );
+             CREATE TABLE area (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL
+             );
+             CREATE TABLE release (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL,
+                 artist_credit INTEGER NOT NULL,
+                 release_group INTEGER NOT NULL,
+                 status INTEGER
+             );
+             CREATE TABLE release_country (
+                 release INTEGER NOT NULL,
+                 country INTEGER NOT NULL,
+                 date_year SMALLINT,
+                 date_month SMALLINT,
+                 date_day SMALLINT
+             );
+             CREATE TABLE release_unknown_country (
+                 release INTEGER NOT NULL,
+                 date_year SMALLINT,
+                 date_month SMALLINT,
+                 date_day SMALLINT
+             );
+             CREATE TABLE l_recording_release (
+                 id INTEGER PRIMARY KEY,
+                 link INTEGER NOT NULL,
+                 entity0 INTEGER NOT NULL,
+                 entity1 INTEGER NOT NULL
+             );
+             CREATE TABLE recording (
+                 id INTEGER PRIMARY KEY,
+                 gid VARCHAR NOT NULL,
+                 name VARCHAR NOT NULL,
+                 artist_credit INTEGER NOT NULL,
+                 length INTEGER
+             );
+             CREATE TABLE recording_alias (
+                 id INTEGER PRIMARY KEY,
+                 recording INTEGER NOT NULL,
+                 name VARCHAR NOT NULL,
+                 sort_name VARCHAR NOT NULL,
+                 locale VARCHAR,
+                 primary_for_locale BOOLEAN NOT NULL DEFAULT FALSE
+             );
+             INSERT INTO artist (id, gid, name, sort_name, comment) VALUES
+                (1, 'a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432', 'U2', 'U2', 'Irish rock band'),
+                (2, 'enya-gid', 'Enya', 'Enya', '');
+             INSERT INTO artist_credit (id, name, artist_count, gid) VALUES
+                (1, 'U2', 1, 'ac-u2-gid'),
+                (2, 'Enya', 1, 'ac-enya-gid');
+             INSERT INTO artist_credit_name (artist_credit, position, artist, name, join_phrase) VALUES
+                (1, 1, 1, 'U2', ''),
+                (2, 1, 2, 'Enya', '');
+             INSERT INTO area (id, gid, name) VALUES
+                (1, 'area-gb-gid', 'United Kingdom');
+             INSERT INTO release (id, gid, name, artist_credit, release_group, status) VALUES
+                (1, 'rel-uk-1987-gid', 'The Joshua Tree', 1, 1, 1);
+             INSERT INTO release_country (release, country, date_year, date_month, date_day) VALUES
+                (1, 1, 1987, 3, 9);
+             INSERT INTO l_recording_release (id, link, entity0, entity1) VALUES
+                (1, 1, 172334, 1);
+             INSERT INTO recording (id, gid, name, artist_credit, length) VALUES
+                (172334, '176ce892-5deb-457b-b3a2-d947c45ac712', 'Where the Streets Have No Name', 1, 337520),
+                (172336, '6b9a509f-6907-4a6e-9345-2f12da09ba4b', 'With or Without You', 1, 296160),
+                (500001, 'rec-live-gid', 'Where the Streets Have No Name', 1, 345000),
+                (500002, 'rec-enya-gid', 'Orinoco Flow', 2, 269600),
+                (500003, 'rec-no-length-gid', 'Untitled', 1, NULL);
+             INSERT INTO recording_alias (id, recording, name, sort_name, locale, primary_for_locale) VALUES
+                (1, 172334, 'Streets', 'Streets', NULL, FALSE),
+                (2, 500001, 'WTSHNN (Live)', 'WTSHNN (Live)', NULL, FALSE);",
+        )
+        .expect("seed recording fixture");
+        conn
+    }
+
+    #[test]
+    fn recording_exact_name_first_with_duplicates() {
+        let conn = recording_fixture_conn();
+        let result = query_recording(
+            &conn,
+            "Where the Streets Have No Name",
+            None,
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.matches.len(), 2);
+        let first = &result.matches[0];
+        assert_eq!(first.name, "Where the Streets Have No Name");
+        assert_eq!(first.mbid, "176ce892-5deb-457b-b3a2-d947c45ac712");
+        assert_eq!(first.duration_seconds.expect("length"), 337.52);
+        assert_eq!(first.first_release_date.as_deref(), Some("1987-03-09"));
+        assert_eq!(first.artist_credit.len(), 1);
+        assert_eq!(first.artist_credit[0].name, "U2");
+        assert_eq!(first.aliases.len(), 1);
+        assert_eq!(first.aliases[0].name, "Streets");
+        // Duplicate names stay visible (id tiebreaker orders the
+        // canonical recording first; the live variant keeps its alias).
+        let second = &result.matches[1];
+        assert_eq!(second.mbid, "rec-live-gid");
+        assert_eq!(second.aliases.len(), 1);
+        assert_eq!(second.aliases[0].name, "WTSHNN (Live)");
+    }
+
+    #[test]
+    fn recording_alias_exact_surfaces_parent() {
+        let conn = recording_fixture_conn();
+        // "Streets" is the canonical recording's exact alias (tier 1)
+        // and a substring of both duplicate names (tier 2); the
+        // alias-exact hit ranks first.
+        let result = query_recording(&conn, "Streets", None, &QueryOptions::default()).unwrap();
+        assert_eq!(result.matches.len(), 2);
+        assert_eq!(result.matches[0].name, "Where the Streets Have No Name");
+        assert_eq!(
+            result.matches[0].mbid,
+            "176ce892-5deb-457b-b3a2-d947c45ac712"
+        );
+        assert_eq!(result.matches[1].mbid, "rec-live-gid");
+    }
+
+    #[test]
+    fn recording_substring_matches_name() {
+        let conn = recording_fixture_conn();
+        let result = query_recording(&conn, "Orinoco", None, &QueryOptions::default()).unwrap();
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].name, "Orinoco Flow");
+    }
+
+    #[test]
+    fn recording_artist_filter() {
+        let conn = recording_fixture_conn();
+        let result = query_recording(
+            &conn,
+            "Orinoco Flow",
+            Some("Enya"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.matches.len(), 1);
+        let none =
+            query_recording(&conn, "Orinoco Flow", Some("U2"), &QueryOptions::default()).unwrap();
+        assert!(none.matches.is_empty());
+    }
+
+    #[test]
+    fn recording_duration_is_ms_to_seconds() {
+        let conn = recording_fixture_conn();
+        let result =
+            query_recording(&conn, "With or Without You", None, &QueryOptions::default()).unwrap();
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].duration_seconds.expect("length"), 296.16);
+        let untitled = query_recording(&conn, "Untitled", None, &QueryOptions::default()).unwrap();
+        assert!(untitled.matches[0].duration_seconds.is_none());
+    }
+
+    #[test]
+    fn recording_first_release_date_is_best_effort() {
+        let conn = recording_fixture_conn();
+        let result =
+            query_recording(&conn, "With or Without You", None, &QueryOptions::default()).unwrap();
+        // No l_recording_release row: the field is None, never estimated.
+        assert!(result.matches[0].first_release_date.is_none());
+    }
+
+    #[test]
+    fn recording_no_match_returns_empty() {
+        let conn = recording_fixture_conn();
+        let result = query_recording(
+            &conn,
+            "A Song That Does Not Exist",
+            None,
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(result.matches.is_empty());
+    }
+
+    #[test]
+    fn recording_empty_name_is_an_error() {
+        let conn = recording_fixture_conn();
+        assert!(matches!(
+            query_recording(&conn, "", None, &QueryOptions::default()),
+            Err(QueryError::EmptyQuery)
+        ));
+        assert!(matches!(
+            query_recording(&conn, "   ", None, &QueryOptions::default()),
+            Err(QueryError::EmptyQuery)
+        ));
+    }
+
+    #[test]
+    fn recording_limit_applies_after_ranking() {
+        let conn = recording_fixture_conn();
+        let result = query_recording(
+            &conn,
+            "Where the Streets Have No Name",
+            None,
+            &QueryOptions { limit: Some(1) },
+        )
+        .unwrap();
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(
+            result.matches[0].mbid,
+            "176ce892-5deb-457b-b3a2-d947c45ac712"
+        );
+    }
+
+    #[test]
+    fn recording_golden_json_contract() {
+        let conn = recording_fixture_conn();
+        let result = query_recording(
+            &conn,
+            "Where the Streets Have No Name",
+            None,
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let actual = serde_json::to_string(&result).unwrap();
+        let expected =
+            fs::read_to_string(golden_path("query_recording_where_the_streets.json")).unwrap();
         assert_eq!(format!("{actual}\n"), expected);
     }
 }

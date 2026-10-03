@@ -8,7 +8,9 @@
 use duckdb::Connection;
 
 use mbdb::manifest::{ALL, table};
-use mbdb::query::{QueryOptions, query_artist, query_release, query_release_group};
+use mbdb::query::{
+    QueryOptions, query_artist, query_recording, query_release, query_release_group,
+};
 use mbdb::schema::{create_schema, ddl};
 
 /// Query helper: count rows in `information_schema.tables` matching a name.
@@ -187,7 +189,18 @@ fn seed_query_tables(conn: &mut Connection) {
          INSERT INTO track (id, gid, recording, medium, position, number, name,
                             artist_credit, length, is_data_track) VALUES
             (1, 'track-gid-1', 1, 1, 1, '1', 'Where the Streets Have No Name',
-             1, 337973, FALSE);"
+             1, 337973, FALSE);
+         INSERT INTO recording_alias (id, recording, name, sort_name, locale,
+                                      primary_for_locale) VALUES
+            (1, 1, 'Streets', 'Streets', NULL, FALSE);
+         INSERT INTO link_type (id, gid, entity_type0, entity_type1, name,
+                                link_phrase, reverse_link_phrase, long_link_phrase) VALUES
+            (1, 'lt-rec-rel-gid', 'recording', 'release', 'appears on',
+             'appears on', 'appears on', 'appears on');
+         INSERT INTO link (id, link_type) VALUES
+            (1, 1);
+         INSERT INTO l_recording_release (id, link, entity0, entity1) VALUES
+            (1, 1, 1, 1);"
     )
     .unwrap();
 }
@@ -257,4 +270,37 @@ fn smoke_release_query_binds_to_real_schema() {
     assert_eq!(track.name, "Where the Streets Have No Name");
     assert_eq!(track.duration_seconds.expect("length"), 337.973);
     assert_eq!(track.recording_mbid.as_deref(), Some("rec-gid-1"));
+}
+
+#[test]
+fn smoke_recording_query_binds_to_real_schema() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    create_schema(&mut conn).unwrap();
+    seed_query_tables(&mut conn);
+
+    // The recording query binds to the real column set: name gate,
+    // alias join, artist-credit join, l_recording_release first-date
+    // (via link/link_type join), and the nullable length.
+    let result = query_recording(
+        &conn,
+        "Where the Streets Have No Name",
+        None,
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(result.matches.len(), 1);
+    let hit = &result.matches[0];
+    assert_eq!(hit.mbid, "rec-gid-1");
+    assert_eq!(hit.duration_seconds.expect("length"), 337.52);
+    assert_eq!(hit.first_release_date.as_deref(), Some("1987-03-09"));
+    assert_eq!(hit.artist_credit.len(), 1);
+    assert_eq!(hit.artist_credit[0].name, "U2");
+    assert_eq!(hit.aliases.len(), 1);
+    assert_eq!(hit.aliases[0].name, "Streets");
+
+    // The --artist filter binds too.
+    let filtered = query_recording(&conn, "Where", Some("U2"), &QueryOptions::default()).unwrap();
+    assert_eq!(filtered.matches.len(), 1);
+    let none = query_recording(&conn, "Where", Some("Nobody"), &QueryOptions::default()).unwrap();
+    assert!(none.matches.is_empty());
 }

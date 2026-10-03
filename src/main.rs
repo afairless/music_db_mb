@@ -10,7 +10,9 @@ use std::path::PathBuf;
 
 use mbdb::config::{CliOverrides, Config, DEFAULT_CONFIG_PATH, Settings};
 use mbdb::import::{LoadReport, load, rejections_path, verify_integrity};
-use mbdb::query::{QueryOptions, query_artist, query_release, query_release_group};
+use mbdb::query::{
+    QueryOptions, query_artist, query_recording, query_release, query_release_group,
+};
 
 /// The mbdb command-line interface.
 #[derive(Debug, Parser)]
@@ -57,6 +59,25 @@ enum QueryKind {
     /// List the releases of a release group (by gid), optionally with
     /// per-medium tracklists and durations.
     Release(ReleaseArgs),
+    /// Query recordings by name with durations (ms → s), first release
+    /// date, and artist credit.
+    Recording(RecordingArgs),
+}
+
+/// Arguments for `mbdb query recording`.
+#[derive(Debug, Args)]
+struct RecordingArgs {
+    /// Recording name to search for (case-sensitive).
+    #[arg(long, value_name = "NAME")]
+    name: String,
+
+    /// Filter by artist credit name (case-sensitive substring).
+    #[arg(long, value_name = "NAME")]
+    artist: Option<String>,
+
+    /// Cap the number of matches printed (default: all).
+    #[arg(long, value_name = "N")]
+    limit: Option<usize>,
 }
 
 /// Arguments for `mbdb query release`.
@@ -209,6 +230,25 @@ fn run_query(args: &QueryArgs) {
                 limit: release.limit,
             };
             let result = query_release(&conn, &release.release_group, release.inc_tracks, &options);
+            let result = match result {
+                Ok(r) => r,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(1);
+                }
+            };
+            emit_json(&result);
+        }
+        QueryKind::Recording(recording) => {
+            let options = QueryOptions {
+                limit: recording.limit,
+            };
+            let result = query_recording(
+                &conn,
+                &recording.name,
+                recording.artist.as_deref(),
+                &options,
+            );
             let result = match result {
                 Ok(r) => r,
                 Err(error) => {
